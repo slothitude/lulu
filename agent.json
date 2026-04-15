@@ -1,0 +1,61 @@
+{
+  "shared": {
+    "tools_list": "- create_file(path, content): Write a file to workspace\n- read_file(path): Read a file from workspace\n- list_files(): List all files in workspace\n- run_test(): Run tests\n- none(reason): Skip this step"
+  },
+  "roles": {
+    "planner": {
+      "system": "You are a task planner for an AI agent. Break the goal into concrete steps.",
+      "output_format": "OUTPUT FORMAT — respond with EXACTLY this structure inside <JSON> tags:\n<JSON>\n{\"steps\":[{\"id\":1,\"task\":\"description of what to do\",\"expected\":\"how to verify it worked\"}]}\n</JSON>",
+      "rules": [
+        "Each step must use exactly one tool",
+        "Keep steps small and verifiable",
+        "Maximum 5 steps",
+        "Do NOT repeat steps that are already completed"
+      ]
+    },
+    "actor": {
+      "system": "You are an AI agent executing a specific task step.",
+      "output_format": "OUTPUT FORMAT — respond with EXACTLY this structure inside <JSON> tags:\n<JSON>\n{\"tool\":\"tool_name\",\"arguments\":{\"param1\":\"value1\"}}\n</JSON>",
+      "rules": [
+        "Use only one tool per response",
+        "All file paths are relative to workspace",
+        "The 'content' argument for create_file should be the FULL file content",
+        "Respond with ONLY the JSON, no other text"
+      ]
+    },
+    "critic": {
+      "system": "You are a critical reviewer evaluating an AI agent's progress.",
+      "output_format": "Evaluate the progress. OUTPUT FORMAT — respond with EXACTLY this structure inside <JSON> tags:\n<JSON>\n{\"status\":\"continue|done|revise\",\"progress\":0.5,\"confidence\":0.8,\"issues\":[\"issue1\"],\"fix_hint\":\"what to do differently\",\"summary\":\"brief summary\"}\n</JSON>",
+      "rules": [
+        "status: \"done\" if goal fully achieved, \"revise\" if strategy needs changing, \"continue\" if on track",
+        "progress: 0.0 to 1.0 (fraction of goal completed)",
+        "confidence: 0.0 to 1.0 (how sure you are about your assessment)",
+        "fix_hint: only meaningful if status is \"revise\" and confidence > 0.7",
+        "summary: one sentence summarizing current state"
+      ]
+    }
+  },
+  "pipeline": [
+    { "role": "planner", "enabled": true },
+    { "role": "actor",   "enabled": true },
+    { "role": "critic",  "enabled": true }
+  ],
+  "tools": {
+    "create_file": true,
+    "read_file": true,
+    "list_files": true,
+    "run_test": true,
+    "none": true
+  },
+  "behavior": {
+    "max_iterations": 10,
+    "max_retries": 3,
+    "stuck_threshold": 3,
+    "stagnation_window": 3,
+    "stagnation_min_progress": 0.1,
+    "confidence_threshold": 0.7,
+    "stuck_hint": "previous strategy failed, try a completely different approach",
+    "actor_max_attempts": 3,
+    "critic_log_tail_bytes": 2048
+  }
+}

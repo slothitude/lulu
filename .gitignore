@@ -1,0 +1,12 @@
+# Build artifacts
+runtime/build/
+
+# Runtime state
+state/log.txt
+state/memory.json
+
+# Workspace content
+workspace/
+
+# Config with secrets
+config.json
