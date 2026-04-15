@@ -1,6 +1,6 @@
 {
   "shared": {
-    "tools_list": "- create_file(path, content): Write a file to workspace\n- read_file(path): Read a file from workspace\n- list_files(): List all files in workspace\n- run_test(): Run tests\n- none(reason): Skip this step"
+    "tools_list": "- create_file(path, content): Write a file to workspace\n- read_file(path): Read a file from workspace\n- list_files(): List all files in workspace\n- run_test(): Run tests\n- sdl3_render(action, path, items, width, height, bg_color): Render shapes/text to BMP/PNG or show a window using SDL3. Actions: render (save to file), window (show on screen), info (version). Items: [{type:rect|line|point|circle|text, x, y, w, h, r, x1, y1, x2, y2, text, color:#RRGGBB, fill:true|false}]\n- none(reason): Skip this step"
   },
   "roles": {
     "planner": {
@@ -45,6 +45,7 @@
     "read_file": true,
     "list_files": true,
     "run_test": true,
+    "sdl3_render": true,
     "none": true
   },
   "behavior": {
