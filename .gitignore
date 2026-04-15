@@ -3,7 +3,9 @@ runtime/build/
 
 # Runtime state
 state/log.txt
+state/log.jsonl
 state/memory.json
+state/prompt_cache.json
 
 # Workspace content
 workspace/
