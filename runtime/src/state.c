@@ -295,3 +295,63 @@ void state_log_stage(const char *log_path, int iteration, const char *stage,
     cJSON_Delete(entry);
     fclose(f);
 }
+
+void state_log_llm(const char *log_path, int iteration, const char *stage,
+                   const char *prompt_summary, const char *raw_response,
+                   const char *parsed_json, int success,
+                   const char *prompt_hash, int cache_hit) {
+    FILE *f = fopen(log_path, "a");
+    if (!f) return;
+
+    char ts[32];
+    get_iso8601(ts, sizeof(ts));
+
+    cJSON *entry = cJSON_CreateObject();
+    cJSON_AddStringToObject(entry, "ts", ts);
+    cJSON_AddNumberToObject(entry, "iter", iteration);
+    cJSON_AddStringToObject(entry, "stage", stage ? stage : "unknown");
+    cJSON_AddStringToObject(entry, "type", "llm");
+    cJSON_AddBoolToObject(entry, "success", success);
+    cJSON_AddBoolToObject(entry, "parse_success", parsed_json ? 1 : 0);
+
+    if (prompt_hash && prompt_hash[0])
+        cJSON_AddStringToObject(entry, "prompt_hash", prompt_hash);
+    cJSON_AddBoolToObject(entry, "cache_hit", cache_hit ? 1 : 0);
+
+    /* Truncate prompt summary to 200 chars */
+    if (prompt_summary) {
+        char buf[201];
+        size_t len = strlen(prompt_summary);
+        if (len > 200) len = 200;
+        memcpy(buf, prompt_summary, len);
+        buf[len] = 0;
+        cJSON_AddStringToObject(entry, "prompt_summary", buf);
+    }
+
+    /* Truncate raw response to LLM_LOG_MAX */
+    if (raw_response) {
+        size_t raw_len = strlen(raw_response);
+        if (raw_len > LLM_LOG_MAX) {
+            char *trunc = (char *)malloc(LLM_LOG_MAX + 1);
+            if (trunc) {
+                memcpy(trunc, raw_response, LLM_LOG_MAX);
+                trunc[LLM_LOG_MAX] = 0;
+                cJSON_AddStringToObject(entry, "llm_raw_trunc", trunc);
+                free(trunc);
+            }
+        } else {
+            cJSON_AddStringToObject(entry, "llm_raw", raw_response);
+        }
+    }
+
+    if (parsed_json) {
+        cJSON_AddStringToObject(entry, "parsed_json", parsed_json);
+    }
+
+    char *json = cJSON_PrintUnformatted(entry);
+    fprintf(f, "%s\n", json);
+
+    free(json);
+    cJSON_Delete(entry);
+    fclose(f);
+}

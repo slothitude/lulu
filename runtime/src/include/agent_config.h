@@ -44,6 +44,8 @@ typedef struct {
     int   critic_log_tail_bytes;
     int   dry_run;
     int   max_steps_per_iteration;
+    int   enable_prompt_cache;
+    char  cache_path[256];
 } Behavior;
 
 /* Full agent config loaded from agent.json */

@@ -71,6 +71,11 @@ static void load_behavior(cJSON *parent, Behavior *b) {
 
     item = cJSON_GetObjectItem(parent, "max_steps_per_iteration");
     b->max_steps_per_iteration = cJSON_IsNumber(item) ? item->valueint : 0;
+
+    item = cJSON_GetObjectItem(parent, "enable_prompt_cache");
+    b->enable_prompt_cache = cJSON_IsBool(item) ? item->valueint : 0;
+
+    load_prompt_field(parent, "cache_path", b->cache_path, sizeof(b->cache_path));
 }
 
 int agent_config_load(AgentConfig *ac, const char *path) {

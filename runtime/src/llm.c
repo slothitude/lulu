@@ -7,6 +7,7 @@
 #include <ctype.h>
 
 #include "llm.h"
+#include "state.h"
 #include "cJSON.h"
 
 #pragma comment(lib, "winhttp.lib")
@@ -14,6 +15,7 @@
 #define INITIAL_BUF 4096
 #define MAX_RESPONSE_SIZE (256 * 1024)
 #define MAX_JSON_SIZE    (64 * 1024)
+#define CACHE_MAX_ENTRIES 256
 
 static char g_endpoint[256];
 static char g_model[64];
@@ -28,6 +30,120 @@ static char *str_dup(const char *s) {
     char *d = (char *)malloc(len + 1);
     if (d) memcpy(d, s, len + 1);
     return d;
+}
+
+/* ========================= Prompt Cache ========================= */
+
+typedef struct {
+    unsigned long long hash;
+    char *response;
+} CacheEntry;
+
+static CacheEntry g_cache[CACHE_MAX_ENTRIES];
+static int  g_cache_count = 0;
+static int  g_cache_enabled = 0;
+static char g_cache_path[256] = {0};
+static int  g_last_cache_hit = 0;
+static int  g_cache_hits = 0;
+static int  g_cache_misses = 0;
+
+/* FNV-1a 64-bit */
+unsigned long long llm_hash_prompt(const char *prompt) {
+    if (!prompt) return 0;
+    unsigned long long h = 14695981039346656037ULL;
+    while (*prompt) {
+        h ^= (unsigned char)*prompt++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+void llm_hash_to_hex(unsigned long long hash, char *out, size_t out_size) {
+    if (!out || out_size < 17) return;
+    snprintf(out, out_size, "%016llx", hash);
+}
+
+void llm_cache_init(int enabled, const char *cache_path) {
+    g_cache_enabled = enabled;
+    g_cache_count = 0;
+    g_cache_hits = 0;
+    g_cache_misses = 0;
+    g_last_cache_hit = 0;
+    memset(g_cache, 0, sizeof(g_cache));
+    if (cache_path) {
+        strncpy(g_cache_path, cache_path, sizeof(g_cache_path) - 1);
+        g_cache_path[sizeof(g_cache_path) - 1] = 0;
+    } else {
+        g_cache_path[0] = 0;
+    }
+}
+
+int llm_cache_load(void) {
+    if (!g_cache_enabled || g_cache_path[0] == 0) return 0;
+
+    char *data = read_file_contents(g_cache_path);
+    if (!data) return 0;
+
+    cJSON *root = cJSON_Parse(data);
+    free(data);
+    if (!root || !cJSON_IsArray(root)) {
+        if (root) cJSON_Delete(root);
+        return 0;
+    }
+
+    int n = cJSON_GetArraySize(root);
+    if (n > CACHE_MAX_ENTRIES) n = CACHE_MAX_ENTRIES;
+
+    for (int i = 0; i < n; i++) {
+        cJSON *entry = cJSON_GetArrayItem(root, i);
+        cJSON *hash_item = cJSON_GetObjectItem(entry, "hash");
+        cJSON *resp_item = cJSON_GetObjectItem(entry, "response");
+
+        if (cJSON_IsString(hash_item) && cJSON_IsString(resp_item)) {
+            unsigned long long h = 0;
+            sscanf(hash_item->valuestring, "%llx", &h);
+            g_cache[g_cache_count].hash = h;
+            g_cache[g_cache_count].response = str_dup(resp_item->valuestring);
+            g_cache_count++;
+        }
+    }
+
+    cJSON_Delete(root);
+    fprintf(stderr, "[CACHE] Loaded %d entries from %s\n", g_cache_count, g_cache_path);
+    return g_cache_count;
+}
+
+int llm_cache_save(void) {
+    if (!g_cache_enabled || g_cache_path[0] == 0 || g_cache_count == 0) return 0;
+
+    cJSON *root = cJSON_CreateArray();
+    for (int i = 0; i < g_cache_count; i++) {
+        if (!g_cache[i].response) continue;
+        cJSON *entry = cJSON_CreateObject();
+        char hex[17];
+        llm_hash_to_hex(g_cache[i].hash, hex, sizeof(hex));
+        cJSON_AddStringToObject(entry, "hash", hex);
+        cJSON_AddStringToObject(entry, "response", g_cache[i].response);
+        cJSON_AddItemToArray(root, entry);
+    }
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    int ok = write_file_atomic(g_cache_path, json);
+    free(json);
+    if (ok) fprintf(stderr, "[CACHE] Saved %d entries to %s\n", g_cache_count, g_cache_path);
+    return ok;
+}
+
+void llm_cache_stats(int *hits, int *misses, int *entries) {
+    if (hits) *hits = g_cache_hits;
+    if (misses) *misses = g_cache_misses;
+    if (entries) *entries = g_cache_count;
+}
+
+int llm_last_cache_hit(void) {
+    return g_last_cache_hit;
 }
 
 static void trim(char *s) {
@@ -209,6 +325,20 @@ cleanup:
 /* ========================= LLM Chat ========================= */
 
 char *llm_chat(const char *prompt, int max_retries) {
+    /* Cache check */
+    unsigned long long hash = llm_hash_prompt(prompt);
+    if (g_cache_enabled) {
+        for (int i = 0; i < g_cache_count; i++) {
+            if (g_cache[i].hash == hash && g_cache[i].response) {
+                g_last_cache_hit = 1;
+                g_cache_hits++;
+                return str_dup(g_cache[i].response);
+            }
+        }
+    }
+    g_last_cache_hit = 0;
+    g_cache_misses++;
+
     char *escaped = llm_escape_json_string(prompt);
     if (!escaped) return NULL;
 
@@ -262,6 +392,14 @@ char *llm_chat(const char *prompt, int max_retries) {
         cJSON_Delete(root);
         free(resp);
         free(payload);
+
+        /* Store in cache */
+        if (g_cache_enabled && result && g_cache_count < CACHE_MAX_ENTRIES) {
+            g_cache[g_cache_count].hash = hash;
+            g_cache[g_cache_count].response = str_dup(result);
+            g_cache_count++;
+        }
+
         return result;
     }
 

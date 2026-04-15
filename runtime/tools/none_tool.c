@@ -19,9 +19,10 @@ static cJSON *none(cJSON *args, const char *workspace, char **error) {
 }
 
 static ToolInfo info = {
+    TOOL_API_VERSION_MAX,
+    sizeof(ToolInfo),
     "none",
     "Skip this step",
-    "1.0",
     0,  /* requires_workspace */
     1,  /* is_idempotent */
     0   /* has_side_effects */

@@ -11,4 +11,4 @@ typedef struct {
 } CriticResult;
 
 /* Run critic on the current log and memory. Returns evaluated result. */
-CriticResult critic_run(const char *log_path, WorkingMemory *mem, const char *goal);
+CriticResult critic_run(const char *log_path, WorkingMemory *mem, const char *goal, int iteration);

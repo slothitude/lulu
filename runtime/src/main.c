@@ -33,16 +33,79 @@ static void print_banner(void) {
 
 /* ========================= Replay Mode ========================= */
 
-static int run_replay(const char *log_path) {
+static void replay_print_entry(const char *line) {
+    cJSON *entry = cJSON_Parse(line);
+    if (!entry) return;
+
+    cJSON *ts_item    = cJSON_GetObjectItem(entry, "ts");
+    cJSON *iter_item  = cJSON_GetObjectItem(entry, "iter");
+    cJSON *stage_item = cJSON_GetObjectItem(entry, "stage");
+    cJSON *type_item  = cJSON_GetObjectItem(entry, "type");
+    cJSON *step_item  = cJSON_GetObjectItem(entry, "step");
+    cJSON *tool_item  = cJSON_GetObjectItem(entry, "tool");
+    cJSON *succ_item  = cJSON_GetObjectItem(entry, "success");
+    cJSON *sum_item   = cJSON_GetObjectItem(entry, "summary");
+    cJSON *llm_item   = cJSON_GetObjectItem(entry, "llm_raw");
+
+    const char *ts    = cJSON_IsString(ts_item)    ? ts_item->valuestring    : "?";
+    int         iter  = cJSON_IsNumber(iter_item)  ? iter_item->valueint     : 0;
+    const char *stage = cJSON_IsString(stage_item) ? stage_item->valuestring : "?";
+    const char *type  = cJSON_IsString(type_item)  ? type_item->valuestring  : NULL;
+
+    if (type && strcmp(type, "llm") == 0) {
+        /* LLM log entry */
+        cJSON *prompt_item = cJSON_GetObjectItem(entry, "prompt_summary");
+        cJSON *phash_item  = cJSON_GetObjectItem(entry, "prompt_hash");
+        cJSON *chit_item   = cJSON_GetObjectItem(entry, "cache_hit");
+        const char *prompt = cJSON_IsString(prompt_item) ? prompt_item->valuestring : "";
+        const char *phash  = cJSON_IsString(phash_item)  ? phash_item->valuestring  : "";
+        int cache_hit = cJSON_IsBool(chit_item) ? chit_item->valueint : 0;
+        int success = cJSON_IsBool(succ_item) ? succ_item->valueint : 0;
+        printf("[%s] %s/llm | iter=%d | %s | %s | hash=%s%s\n",
+               ts, stage, iter, success ? "OK" : "FAIL",
+               prompt, phash,
+               cache_hit ? " [CACHED]" : "");
+    } else if (sum_item && cJSON_IsString(sum_item)) {
+        /* Stage event (planner/critic) */
+        printf("[%s] %s | iter=%d | %s\n", ts, stage, iter, sum_item->valuestring);
+    } else {
+        /* Actor step event */
+        const char *tool = cJSON_IsString(tool_item) ? tool_item->valuestring : "?";
+        int step = cJSON_IsNumber(step_item) ? step_item->valueint : 0;
+        int success = cJSON_IsBool(succ_item) ? succ_item->valueint : 0;
+
+        printf("[%s] %s | iter=%d step=%d | tool=%s | %s\n",
+               ts, stage, iter, step, tool, success ? "OK" : "FAIL");
+    }
+
+    cJSON_Delete(entry);
+}
+
+static int run_replay(const char *log_path, const char *filter_stage, int filter_last) {
     FILE *f = fopen(log_path, "r");
     if (!f) {
         fprintf(stderr, "[REPLAY] Cannot open %s\n", log_path);
         return 1;
     }
 
+    /* Ring buffer for --last filtering (constant memory) */
+    char **ring = NULL;
+    int ring_size = 0;
+    int ring_idx = 0;      /* next write position */
+    int match_count = 0;
+    int total_count = 0;
+
+    if (filter_last > 0) {
+        ring_size = filter_last;
+        ring = (char **)calloc(ring_size, sizeof(char *));
+    }
+
     char line[8192];
-    int count = 0;
-    printf("[REPLAY] Log: %s\n\n", log_path);
+
+    printf("[REPLAY] Log: %s\n", log_path);
+    if (filter_stage) printf("[REPLAY] Filter: stage=%s\n", filter_stage);
+    if (filter_last > 0) printf("[REPLAY] Filter: last=%d\n", filter_last);
+    printf("\n");
 
     while (fgets(line, sizeof(line), f)) {
         /* Strip trailing newline */
@@ -50,40 +113,52 @@ static int run_replay(const char *log_path) {
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
         if (len == 0) continue;
 
-        cJSON *entry = cJSON_Parse(line);
-        if (!entry) continue;
+        total_count++;
 
-        cJSON *ts_item    = cJSON_GetObjectItem(entry, "ts");
-        cJSON *iter_item  = cJSON_GetObjectItem(entry, "iter");
-        cJSON *stage_item = cJSON_GetObjectItem(entry, "stage");
-        cJSON *step_item  = cJSON_GetObjectItem(entry, "step");
-        cJSON *tool_item  = cJSON_GetObjectItem(entry, "tool");
-        cJSON *succ_item  = cJSON_GetObjectItem(entry, "success");
-        cJSON *sum_item   = cJSON_GetObjectItem(entry, "summary");
+        /* If filtering by stage, check match */
+        if (filter_stage) {
+            cJSON *entry = cJSON_Parse(line);
+            if (!entry) continue;
 
-        const char *ts    = cJSON_IsString(ts_item)    ? ts_item->valuestring    : "?";
-        int         iter  = cJSON_IsNumber(iter_item)  ? iter_item->valueint     : 0;
-        const char *stage = cJSON_IsString(stage_item) ? stage_item->valuestring : "?";
+            cJSON *stage_item = cJSON_GetObjectItem(entry, "stage");
+            const char *stage = cJSON_IsString(stage_item) ? stage_item->valuestring : NULL;
 
-        if (sum_item && cJSON_IsString(sum_item)) {
-            /* Stage event (planner/critic) */
-            printf("[%s] %s | iter=%d | %s\n", ts, stage, iter, sum_item->valuestring);
-        } else {
-            /* Actor step event */
-            const char *tool = cJSON_IsString(tool_item) ? tool_item->valuestring : "?";
-            int step = cJSON_IsNumber(step_item) ? step_item->valueint : 0;
-            int success = cJSON_IsBool(succ_item) ? succ_item->valueint : 0;
+            int matches = (stage && strcmp(stage, filter_stage) == 0);
+            cJSON_Delete(entry);
 
-            printf("[%s] %s | iter=%d step=%d | tool=%s | %s\n",
-                   ts, stage, iter, step, tool, success ? "OK" : "FAIL");
+            if (!matches) continue;
         }
 
-        cJSON_Delete(entry);
-        count++;
+        match_count++;
+
+        if (filter_last > 0) {
+            /* Ring buffer: overwrite oldest */
+            free(ring[ring_idx % ring_size]);
+            ring[ring_idx % ring_size] = _strdup(line);
+            ring_idx++;
+        } else {
+            replay_print_entry(line);
+        }
     }
 
     fclose(f);
-    printf("\n[REPLAY] %d entries displayed\n", count);
+
+    /* If --last, drain ring buffer in order */
+    if (filter_last > 0 && ring) {
+        /* Calculate start: the oldest entry in the ring */
+        int count = (ring_idx < ring_size) ? ring_idx : ring_size;
+        int start = (ring_idx < ring_size) ? 0 : (ring_idx % ring_size);
+        for (int i = 0; i < count; i++) {
+            int idx = (start + i) % ring_size;
+            if (ring[idx]) {
+                replay_print_entry(ring[idx]);
+                free(ring[idx]);
+            }
+        }
+        free(ring);
+    }
+
+    printf("\n[REPLAY] %d entries displayed (%d total)\n", match_count, total_count);
     return 0;
 }
 
@@ -110,15 +185,29 @@ static void print_summary(WorkingMemory *mem, int iterations) {
     }
     printf("Errors: %d\n", mem->errors_count);
     printf("Summary: %s\n", mem->summary[0] ? mem->summary : "N/A");
+
+    /* Cache stats */
+    int ch_hits, ch_misses, ch_entries;
+    llm_cache_stats(&ch_hits, &ch_misses, &ch_entries);
+    if (ch_entries > 0 || ch_hits > 0) {
+        printf("Cache: %d hits, %d misses, %d entries\n", ch_hits, ch_misses, ch_entries);
+    }
+
     printf("========================================\n");
 }
 
 int main(int argc, char *argv[]) {
-    /* Check for --replay flag */
+    /* Check for --replay flag and filters */
     int replay_mode = 0;
+    const char *filter_stage = NULL;
+    int filter_last = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--replay") == 0) {
             replay_mode = 1;
+        } else if (strcmp(argv[i], "--stage") == 0 && i + 1 < argc) {
+            filter_stage = argv[++i];
+        } else if (strcmp(argv[i], "--last") == 0 && i + 1 < argc) {
+            filter_last = atoi(argv[++i]);
         }
     }
 
@@ -157,7 +246,7 @@ int main(int argc, char *argv[]) {
 
     /* Replay mode: read log and exit, no LLM calls */
     if (replay_mode) {
-        return run_replay(log_path);
+        return run_replay(log_path, filter_stage, filter_last);
     }
 
     /* Load LLM config */
@@ -182,6 +271,22 @@ int main(int argc, char *argv[]) {
 
     /* Initialize LLM */
     llm_init(cfg.endpoint, cfg.model, cfg.apikey, cfg.http_timeout_ms);
+
+    /* Initialize prompt cache */
+    {
+        char cache_file_path[MAX_PATH];
+        if (g_agent_cfg.behavior.cache_path[0]) {
+            /* Resolve relative to base_dir */
+            snprintf(cache_file_path, MAX_PATH, "%s\\%s", base_dir, g_agent_cfg.behavior.cache_path);
+        } else {
+            snprintf(cache_file_path, MAX_PATH, "%s\\state\\prompt_cache.json", base_dir);
+        }
+        llm_cache_init(g_agent_cfg.behavior.enable_prompt_cache, cache_file_path);
+        if (g_agent_cfg.behavior.enable_prompt_cache) {
+            llm_cache_load();
+            printf("[INIT] Prompt cache enabled: %s\n", cache_file_path);
+        }
+    }
 
     /* Load tool DLLs */
     int tool_count = tools_load_all(tools_dir);
@@ -283,7 +388,7 @@ int main(int argc, char *argv[]) {
 
             steps = planner_run(goal, &mem,
                 planner_hint[0] ? planner_hint : NULL,
-                &step_count);
+                &step_count, log_path, iter);
 
             if (!steps || step_count == 0) {
                 fprintf(stderr, "[ORCH] Planner failed, stopping\n");
@@ -320,7 +425,7 @@ int main(int argc, char *argv[]) {
 
                 print_step_header(iter, steps[s].id, steps[s].task);
 
-                ActorResult ar = actor_run(&steps[s], &mem, workspace_path);
+                ActorResult ar = actor_run(&steps[s], &mem, workspace_path, log_path, iter);
 
                 state_log_step(log_path, steps[s].id, ar.tool, ar.args, ar.result, ar.success, iter, "actor");
 
@@ -368,7 +473,7 @@ int main(int argc, char *argv[]) {
 
         /* CRITIC (if enabled) */
         if (has_critic) {
-            CriticResult critic = critic_run(log_path, &mem, goal);
+            CriticResult critic = critic_run(log_path, &mem, goal, iter);
 
             /* Log critic stage */
             state_log_stage(log_path, iter, "critic", critic.summary[0] ? critic.summary : critic.status, 1);
@@ -415,6 +520,9 @@ int main(int argc, char *argv[]) {
     }
 
     print_summary(&mem, cfg.max_iterations);
+
+    /* Save prompt cache before exit */
+    llm_cache_save();
 
     free(goal);
     free(last_hashes);

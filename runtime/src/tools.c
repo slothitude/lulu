@@ -77,7 +77,23 @@ int tools_load_all(const char *dir) {
             continue;
         }
 
+        if (info->api_version < TOOL_API_VERSION_MIN ||
+            info->api_version > TOOL_API_VERSION_MAX) {
+            fprintf(stderr, "[TOOLS] %s: API version mismatch (got %d, need [%d,%d])\n",
+                    fd.cFileName, info->api_version, TOOL_API_VERSION_MIN, TOOL_API_VERSION_MAX);
+            FreeLibrary(lib);
+            continue;
+        }
+
+        if (info->struct_size != sizeof(ToolInfo)) {
+            fprintf(stderr, "[TOOLS] %s: struct size mismatch (got %d, expected %d)\n",
+                    fd.cFileName, info->struct_size, (int)sizeof(ToolInfo));
+            FreeLibrary(lib);
+            continue;
+        }
+
         LoadedTool *t = &g_tools[g_tool_count];
+        t->api_version = info->api_version;
         strncpy(t->name, info->name, sizeof(t->name) - 1);
         t->name[sizeof(t->name) - 1] = 0;
         t->fn = fn;

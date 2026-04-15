@@ -10,3 +10,16 @@ char *llm_extract_json(const char *response);
 
 /* Escape a string for JSON embedding. Returns malloc'd string. */
 char *llm_escape_json_string(const char *s);
+
+/* Prompt cache (FNV-1a 64-bit hash based) */
+void llm_cache_init(int enabled, const char *cache_path);
+int  llm_cache_load(void);
+int  llm_cache_save(void);
+void llm_cache_stats(int *hits, int *misses, int *entries);
+
+/* Hash utility — exposed for agent_core to compute prompt_hash for logging */
+unsigned long long llm_hash_prompt(const char *prompt);
+void llm_hash_to_hex(unsigned long long hash, char *out, size_t out_size);
+
+/* Query last cache hit status (call right after llm_chat) */
+int llm_last_cache_hit(void);

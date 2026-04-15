@@ -14,7 +14,10 @@ typedef struct {
 typedef struct {
     cJSON *parsed;      /* caller owns, must cJSON_Delete */
     char *raw_json;     /* caller owns, must free */
+    char *llm_response; /* full raw LLM text, caller owns, must free */
     int retries_used;
+    char prompt_hash[17]; /* hex string of fnv1a64 */
+    int  cache_hit;
 } AgentRaw;
 
 /* Build rules text from template — replaces 3 identical copies */
@@ -32,3 +35,6 @@ AgentRaw agent_call_llm(const char *prompt, int max_retries);
 
 /* Convenience: build prompt + call LLM in one shot */
 AgentRaw agent_run_call(const AgentCall *call);
+
+/* Free all owned fields of an AgentRaw. Does not free the struct itself. */
+void agent_raw_free(AgentRaw *r);

@@ -42,6 +42,24 @@ for each iteration:
 
 All three stages are gated by the `pipeline` config. Stuck detection and stagnation tracking prevent infinite loops.
 
+## Prompt Cache
+
+LLM responses are cached in-memory using FNV-1a 64-bit hash deduplication. Identical prompts skip the HTTP call entirely. Cache persists across runs as a JSON file.
+
+```json
+"behavior": {
+  "enable_prompt_cache": true,
+  "cache_path": "state/prompt_cache.json"
+}
+```
+
+Features:
+- **Zero-dependency FNV-1a hash** — fast, no collisions for typical prompts
+- **256-entry in-memory table** — more than enough per session
+- **JSON file persistence** — survives restarts, loads on init, saves on exit
+- **Observability** — every LLM log entry includes `prompt_hash` and `cache_hit` fields
+- **Loop detection** — `--replay` shows hashes; duplicate hashes = agent spinning
+
 ## Pipeline Configuration
 
 ```json

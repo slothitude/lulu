@@ -65,9 +65,10 @@ static cJSON *list_files(cJSON *args, const char *workspace, char **error) {
 }
 
 static ToolInfo info = {
+    TOOL_API_VERSION_MAX,
+    sizeof(ToolInfo),
     "list_files",
     "List all files in workspace",
-    "1.0",
     1,  /* requires_workspace */
     1,  /* is_idempotent */
     0   /* has_side_effects */

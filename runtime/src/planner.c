@@ -10,7 +10,8 @@
 
 extern AgentConfig g_agent_cfg;
 
-PlannerStep *planner_run(const char *goal, WorkingMemory *mem, const char *extra_hint, int *count) {
+PlannerStep *planner_run(const char *goal, WorkingMemory *mem, const char *extra_hint,
+                         int *count, const char *log_path, int iteration) {
     *count = 0;
 
     /* Build context body */
@@ -30,27 +31,34 @@ PlannerStep *planner_run(const char *goal, WorkingMemory *mem, const char *extra
     /* Call generic engine */
     AgentCall call = { &g_agent_cfg.planner, g_agent_cfg.shared.tools_list, context, 3 };
     AgentRaw raw = agent_run_call(&call);
+
+    /* Log raw LLM response */
+    state_log_llm(log_path, iteration, "planner", context,
+                  raw.llm_response, raw.raw_json, raw.parsed ? 1 : 0,
+                  raw.prompt_hash, raw.cache_hit);
+
     if (!raw.parsed) {
         fprintf(stderr, "[PLANNER] LLM call failed\n");
+        agent_raw_free(&raw);
         return NULL;
     }
 
     /* Parse role-specific output: steps[] */
     cJSON *steps_arr = cJSON_GetObjectItem(raw.parsed, "steps");
     if (!cJSON_IsArray(steps_arr)) {
-        cJSON_Delete(raw.parsed); free(raw.raw_json);
+        agent_raw_free(&raw);
         return NULL;
     }
 
     int n = cJSON_GetArraySize(steps_arr);
     if (n <= 0 || n > 10) {
-        cJSON_Delete(raw.parsed); free(raw.raw_json);
+        agent_raw_free(&raw);
         return NULL;
     }
 
     PlannerStep *steps = (PlannerStep *)calloc(n, sizeof(PlannerStep));
     if (!steps) {
-        cJSON_Delete(raw.parsed); free(raw.raw_json);
+        agent_raw_free(&raw);
         return NULL;
     }
 
@@ -72,8 +80,7 @@ PlannerStep *planner_run(const char *goal, WorkingMemory *mem, const char *extra
     }
 
     *count = n;
-    cJSON_Delete(raw.parsed);
-    free(raw.raw_json);
+    agent_raw_free(&raw);
 
     fprintf(stderr, "[PLANNER] Generated %d steps\n", n);
     return steps;

@@ -3,6 +3,9 @@
 
 #include "cJSON.h"
 
+#define TOOL_API_VERSION_MIN 1
+#define TOOL_API_VERSION_MAX 1
+
 #ifdef _WIN32
   #ifdef TOOL_BUILDING_DLL
     #define TOOL_EXPORT __declspec(dllexport)
@@ -14,9 +17,10 @@
 #endif
 
 typedef struct {
+    int api_version;               /* must be in [TOOL_API_VERSION_MIN, TOOL_API_VERSION_MAX] */
+    int struct_size;               /* must equal sizeof(ToolInfo) */
     const char *name;
     const char *description;
-    const char *api_version;       /* "1.0" */
     int requires_workspace;
     int is_idempotent;             /* safe to retry */
     int has_side_effects;

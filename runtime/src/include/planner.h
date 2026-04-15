@@ -10,4 +10,5 @@ typedef struct {
 } PlannerStep;
 
 /* Run planner, returns array of steps. Sets *count. Returns NULL on failure. */
-PlannerStep *planner_run(const char *goal, WorkingMemory *mem, const char *extra_hint, int *count);
+PlannerStep *planner_run(const char *goal, WorkingMemory *mem, const char *extra_hint,
+                         int *count, const char *log_path, int iteration);

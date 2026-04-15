@@ -58,6 +58,8 @@
     "actor_max_attempts": 3,
     "critic_log_tail_bytes": 2048,
     "dry_run": false,
-    "max_steps_per_iteration": 0
+    "max_steps_per_iteration": 0,
+    "enable_prompt_cache": true,
+    "cache_path": "state/prompt_cache.json"
   }
 }

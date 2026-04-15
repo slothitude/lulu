@@ -77,7 +77,7 @@ static char *build_critic_context(const char *log_path, WorkingMemory *mem, cons
     return context;
 }
 
-CriticResult critic_run(const char *log_path, WorkingMemory *mem, const char *goal) {
+CriticResult critic_run(const char *log_path, WorkingMemory *mem, const char *goal, int iteration) {
     CriticResult result = default_critic_result();
 
     char *context = build_critic_context(log_path, mem, goal);
@@ -88,8 +88,14 @@ CriticResult critic_run(const char *log_path, WorkingMemory *mem, const char *go
     AgentRaw raw = agent_run_call(&call);
     free(context);
 
+    /* Log raw LLM response */
+    state_log_llm(log_path, iteration, "critic", "critic evaluation",
+                  raw.llm_response, raw.raw_json, raw.parsed ? 1 : 0,
+                  raw.prompt_hash, raw.cache_hit);
+
     if (!raw.parsed) {
         fprintf(stderr, "[CRITIC] LLM call failed\n");
+        agent_raw_free(&raw);
         return result;
     }
 
@@ -144,8 +150,7 @@ CriticResult critic_run(const char *log_path, WorkingMemory *mem, const char *go
         strncpy(mem->summary, item->valuestring, sizeof(mem->summary) - 1);
     }
 
-    cJSON_Delete(raw.parsed);
-    free(raw.raw_json);
+    agent_raw_free(&raw);
 
     fprintf(stderr, "[CRITIC] status=%s progress=%.1f confidence=%.1f\n",
             result.status, result.progress, result.confidence);

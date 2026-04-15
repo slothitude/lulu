@@ -69,9 +69,16 @@ char *agent_build_prompt(const PromptTemplate *role, const char *tools_list,
 }
 
 AgentRaw agent_call_llm(const char *prompt, int max_retries) {
-    AgentRaw r = {NULL, NULL, 0};
+    AgentRaw r = {NULL, NULL, NULL, 0, {0}, 0};
+
+    /* Compute prompt hash for logging */
+    unsigned long long h = llm_hash_prompt(prompt);
+    llm_hash_to_hex(h, r.prompt_hash, sizeof(r.prompt_hash));
+
     char *response = llm_chat(prompt, max_retries);
+    r.cache_hit = llm_last_cache_hit();
     if (!response) return r;
+    r.llm_response = _strdup(response);
     r.raw_json = llm_extract_json(response);
     free(response);
     if (!r.raw_json) return r;
@@ -81,8 +88,18 @@ AgentRaw agent_call_llm(const char *prompt, int max_retries) {
 
 AgentRaw agent_run_call(const AgentCall *call) {
     char *prompt = agent_build_prompt(call->role, call->tools_list, call->context_body);
-    if (!prompt) return (AgentRaw){NULL, NULL, 0};
+    if (!prompt) return (AgentRaw){NULL, NULL, NULL, 0, {0}, 0};
     AgentRaw r = agent_call_llm(prompt, call->max_retries);
     free(prompt);
     return r;
+}
+
+void agent_raw_free(AgentRaw *r) {
+    if (!r) return;
+    if (r->parsed) cJSON_Delete(r->parsed);
+    free(r->raw_json);
+    free(r->llm_response);
+    r->parsed = NULL;
+    r->raw_json = NULL;
+    r->llm_response = NULL;
 }

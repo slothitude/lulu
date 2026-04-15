@@ -66,7 +66,8 @@ static int step_already_satisfied(PlannerStep *step, const char *workspace) {
     return 0;
 }
 
-ActorResult actor_run(PlannerStep *step, WorkingMemory *mem, const char *workspace) {
+ActorResult actor_run(PlannerStep *step, WorkingMemory *mem, const char *workspace,
+                      const char *log_path, int iteration) {
     ActorResult result = {0};
     result.args = NULL;
     result.result = NULL;
@@ -115,16 +116,22 @@ ActorResult actor_run(PlannerStep *step, WorkingMemory *mem, const char *workspa
         AgentCall call = { &g_agent_cfg.actor, g_agent_cfg.shared.tools_list, context, 2 };
         AgentRaw raw = agent_run_call(&call);
 
+        /* Log raw LLM response */
+        state_log_llm(log_path, iteration, "actor", context,
+                      raw.llm_response, raw.raw_json, raw.parsed ? 1 : 0,
+                      raw.prompt_hash, raw.cache_hit);
+
         if (!raw.parsed) {
             result.retries++;
             fprintf(stderr, "[ACTOR] Could not extract JSON (attempt %d)\n", attempt + 1);
+            agent_raw_free(&raw);
             continue;
         }
 
         /* Extract tool name */
         cJSON *tool_item = cJSON_GetObjectItem(raw.parsed, "tool");
         if (!cJSON_IsString(tool_item)) {
-            cJSON_Delete(raw.parsed); free(raw.raw_json);
+            agent_raw_free(&raw);
             result.retries++;
             continue;
         }
@@ -142,7 +149,11 @@ ActorResult actor_run(PlannerStep *step, WorkingMemory *mem, const char *workspa
         }
 
         cJSON_Delete(raw.parsed);
+        raw.parsed = NULL;
         free(raw.raw_json);
+        raw.raw_json = NULL;
+        free(raw.llm_response);
+        raw.llm_response = NULL;
 
         /* Normalize path arguments */
         cJSON *path_arg = cJSON_GetObjectItem(args, "path");
@@ -171,9 +182,22 @@ ActorResult actor_run(PlannerStep *step, WorkingMemory *mem, const char *workspa
         if (g_agent_cfg.behavior.dry_run) {
             result.result = cJSON_CreateObject();
             cJSON_AddStringToObject(result.result, "status", "simulated");
-            char would_do[256];
-            snprintf(would_do, sizeof(would_do), "Would execute %s", result.tool);
+
+            /* Build would_do from tool name + key arguments */
+            char would_do[512];
+            cJSON *path_arg = cJSON_GetObjectItem(args, "path");
+            if (cJSON_IsString(path_arg)) {
+                snprintf(would_do, sizeof(would_do), "%s(path='%s')",
+                         result.tool, path_arg->valuestring);
+            } else {
+                snprintf(would_do, sizeof(would_do), "%s()", result.tool);
+            }
             cJSON_AddStringToObject(result.result, "would_do", would_do);
+            cJSON_AddStringToObject(result.result, "description",
+                                    tool->description[0] ? tool->description : "");
+            cJSON_AddBoolToObject(result.result, "side_effects", tool->has_side_effects);
+            cJSON_AddBoolToObject(result.result, "idempotent", tool->is_idempotent);
+            cJSON_AddBoolToObject(result.result, "requires_workspace", tool->requires_workspace);
             result.success = 1;
             fprintf(stderr, "[ACTOR] [DRY-RUN] Skipped %s\n", result.tool);
             break;

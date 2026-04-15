@@ -57,9 +57,10 @@ static cJSON *read_file(cJSON *args, const char *workspace, char **error) {
 }
 
 static ToolInfo info = {
+    TOOL_API_VERSION_MAX,
+    sizeof(ToolInfo),
     "read_file",
     "Read a file from workspace",
-    "1.0",
     1,  /* requires_workspace */
     1,  /* is_idempotent */
     0   /* has_side_effects */

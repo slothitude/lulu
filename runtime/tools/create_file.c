@@ -72,9 +72,10 @@ static cJSON *create_file(cJSON *args, const char *workspace, char **error) {
 }
 
 static ToolInfo info = {
+    TOOL_API_VERSION_MAX,
+    sizeof(ToolInfo),
     "create_file",
     "Create a file with given content",
-    "1.0",
     1,  /* requires_workspace */
     0,  /* is_idempotent */
     1   /* has_side_effects */

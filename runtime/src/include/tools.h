@@ -2,6 +2,7 @@
 #include "tool_api.h"
 
 typedef struct {
+    int api_version;
     char name[64];
     tool_execute_fn fn;
     int enabled;
