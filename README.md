@@ -101,7 +101,45 @@ tool_execute_fn tool_get_execute(void);     // cJSON *(*fn)(cJSON *args, const c
 | `read_file.dll` | `read_file(path)` | Read file from workspace |
 | `list_files.dll` | `list_files()` | List workspace contents |
 | `run_test.dll` | `run_test()` | Parse test_results.txt |
+| `sdl3_render.dll` | `sdl3_render(action, path, ...)` | Render shapes/text to images (SDL3) |
 | `none.dll` | `none(reason)` | Skip step |
+
+### SDL3 Render Tool
+
+Renders shapes and text to PNG/BMP images or opens a live window. Built on SDL3 + SDL3_image.
+
+**Actions:**
+- `render` (default) — draw to offscreen surface, save to file in workspace
+- `window` — open a visible SDL3 window for a timed display
+- `info` — return SDL3 version string
+
+**Arguments:**
+- `path` — output filename (e.g. `"output.png"` or `"output.bmp"`)
+- `action` — `render`, `window`, or `info`
+- `width`, `height` — canvas size (default 640x480)
+- `bg_color` — background color as hex `#RRGGBB` or named color
+- `items` / `shapes` / `elements` — array of draw commands (forgiving aliases)
+
+**Draw commands:**
+```json
+{"type": "rect",    "x": 10, "y": 10, "w": 100, "h": 50, "color": "red", "fill": true}
+{"type": "circle",  "x": 200, "y": 200, "r": 50, "color": "#00FF00", "fill": true}
+{"type": "line",    "x1": 0, "y1": 0, "x2": 300, "y2": 300, "color": "white"}
+{"type": "point",   "x": 150, "y": 150, "color": "yellow"}
+{"type": "text",    "x": 50, "y": 100, "text": "Hello SDL3", "color": "cyan"}
+```
+
+**Named colors:** red, green, blue, white, black, yellow, cyan, magenta, orange, purple, pink, gray, darkblue, darkgreen, darkred, lightblue, brown.
+
+**Build:**
+```bash
+pacman -S mingw-w64-x86_64-sdl3 mingw-w64-x86_64-sdl3-image
+gcc -shared -o tools/sdl3_render.dll runtime/tools/sdl3_render.c \
+    runtime/src/cJSON.c runtime/src/sandbox.c \
+    -I runtime/src/include -lSDL3 -lSDL3_image -lm
+```
+
+Requires `SDL3.dll` and `SDL3_image.dll` in the executable's directory (provided in `libs/`).
 
 ### Tool toggles
 
