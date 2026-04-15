@@ -167,6 +167,18 @@ ActorResult actor_run(PlannerStep *step, WorkingMemory *mem, const char *workspa
             break;
         }
 
+        /* Dry-run: skip actual execution, return simulated result */
+        if (g_agent_cfg.behavior.dry_run) {
+            result.result = cJSON_CreateObject();
+            cJSON_AddStringToObject(result.result, "status", "simulated");
+            char would_do[256];
+            snprintf(would_do, sizeof(would_do), "Would execute %s", result.tool);
+            cJSON_AddStringToObject(result.result, "would_do", would_do);
+            result.success = 1;
+            fprintf(stderr, "[ACTOR] [DRY-RUN] Skipped %s\n", result.tool);
+            break;
+        }
+
         char *err = NULL;
         result.result = tool->fn(args, workspace, &err);
 

@@ -65,6 +65,12 @@ static void load_behavior(cJSON *parent, Behavior *b) {
 
     item = cJSON_GetObjectItem(parent, "critic_log_tail_bytes");
     b->critic_log_tail_bytes = cJSON_IsNumber(item) ? item->valueint : 2048;
+
+    item = cJSON_GetObjectItem(parent, "dry_run");
+    b->dry_run = cJSON_IsBool(item) ? item->valueint : 0;
+
+    item = cJSON_GetObjectItem(parent, "max_steps_per_iteration");
+    b->max_steps_per_iteration = cJSON_IsNumber(item) ? item->valueint : 0;
 }
 
 int agent_config_load(AgentConfig *ac, const char *path) {

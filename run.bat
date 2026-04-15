@@ -6,41 +6,30 @@ echo  BashAgent Hybrid Runtime v1
 echo ========================================
 echo.
 
-REM Build if needed
-if not exist "runtime\build\agent.exe" (
+REM Build if needed or if --build flag passed
+set DO_BUILD=0
+for %%a in (%*) do (
+    if "%%a"=="--build" set DO_BUILD=1
+)
+if not exist "runtime\build\agent.exe" set DO_BUILD=1
+
+if "%DO_BUILD%"=="1" (
     echo [BUILD] Compiling runtime...
     if not exist "runtime\build" mkdir "runtime\build"
     if not exist "tools" mkdir "tools"
 
     set PATH=C:\msys64\mingw64\bin;%PATH%
 
-    REM === Build tool DLLs ===
+    REM === Build tool DLLs (auto-discovers all .c in runtime/tools/) ===
     echo [BUILD] Compiling tool DLLs...
 
-    gcc -shared -std=c11 -D_CRT_SECURE_NO_WARNINGS -DTOOL_BUILDING_DLL ^
-        -I runtime\src\include ^
-        runtime\tools\create_file.c runtime\src\cJSON.c runtime\src\sandbox.c ^
-        -o tools\create_file.dll
-
-    gcc -shared -std=c11 -D_CRT_SECURE_NO_WARNINGS -DTOOL_BUILDING_DLL ^
-        -I runtime\src\include ^
-        runtime\tools\read_file.c runtime\src\cJSON.c runtime\src\sandbox.c ^
-        -o tools\read_file.dll
-
-    gcc -shared -std=c11 -D_CRT_SECURE_NO_WARNINGS -DTOOL_BUILDING_DLL ^
-        -I runtime\src\include ^
-        runtime\tools\list_files.c runtime\src\cJSON.c ^
-        -o tools\list_files.dll
-
-    gcc -shared -std=c11 -D_CRT_SECURE_NO_WARNINGS -DTOOL_BUILDING_DLL ^
-        -I runtime\src\include ^
-        runtime\tools\run_test.c runtime\src\cJSON.c ^
-        -o tools\run_test.dll
-
-    gcc -shared -std=c11 -D_CRT_SECURE_NO_WARNINGS -DTOOL_BUILDING_DLL ^
-        -I runtime\src\include ^
-        runtime\tools\none_tool.c runtime\src\cJSON.c ^
-        -o tools\none.dll
+    for %%f in (runtime\tools\*.c) do (
+        echo [BUILD]   %%~nf.dll
+        gcc -shared -std=c11 -D_CRT_SECURE_NO_WARNINGS -DTOOL_BUILDING_DLL ^
+            -I runtime\src\include ^
+            %%f runtime\src\cJSON.c runtime\src\sandbox.c ^
+            -o tools\%%~nf.dll
+    )
 
     REM === Build host ===
     echo [BUILD] Compiling host...
@@ -81,7 +70,7 @@ if not exist "runtime\build\agent.exe" (
 
 echo [RUN] Starting agent...
 echo.
-runtime\build\agent.exe
+runtime\build\agent.exe %*
 
 echo.
 echo ========================================

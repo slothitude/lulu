@@ -71,7 +71,14 @@ static cJSON *create_file(cJSON *args, const char *workspace, char **error) {
     return r;
 }
 
-static ToolInfo info = { "create_file", "Create a file with given content" };
+static ToolInfo info = {
+    "create_file",
+    "Create a file with given content",
+    "1.0",
+    1,  /* requires_workspace */
+    0,  /* is_idempotent */
+    1   /* has_side_effects */
+};
 
 TOOL_EXPORT const ToolInfo *tool_get_info(void) { return &info; }
 TOOL_EXPORT tool_execute_fn tool_get_execute(void) { return create_file; }

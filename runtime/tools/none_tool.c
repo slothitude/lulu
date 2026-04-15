@@ -18,7 +18,14 @@ static cJSON *none(cJSON *args, const char *workspace, char **error) {
     return r;
 }
 
-static ToolInfo info = { "none", "Skip this step" };
+static ToolInfo info = {
+    "none",
+    "Skip this step",
+    "1.0",
+    0,  /* requires_workspace */
+    1,  /* is_idempotent */
+    0   /* has_side_effects */
+};
 
 TOOL_EXPORT const ToolInfo *tool_get_info(void) { return &info; }
 TOOL_EXPORT tool_execute_fn tool_get_execute(void) { return none; }

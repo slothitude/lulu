@@ -42,6 +42,8 @@ typedef struct {
     char  stuck_hint[512];
     int   actor_max_attempts;
     int   critic_log_tail_bytes;
+    int   dry_run;
+    int   max_steps_per_iteration;
 } Behavior;
 
 /* Full agent config loaded from agent.json */

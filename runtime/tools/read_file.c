@@ -56,7 +56,14 @@ static cJSON *read_file(cJSON *args, const char *workspace, char **error) {
     return r;
 }
 
-static ToolInfo info = { "read_file", "Read a file from workspace" };
+static ToolInfo info = {
+    "read_file",
+    "Read a file from workspace",
+    "1.0",
+    1,  /* requires_workspace */
+    1,  /* is_idempotent */
+    0   /* has_side_effects */
+};
 
 TOOL_EXPORT const ToolInfo *tool_get_info(void) { return &info; }
 TOOL_EXPORT tool_execute_fn tool_get_execute(void) { return read_file; }

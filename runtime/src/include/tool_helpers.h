@@ -2,8 +2,12 @@
 #define TOOL_HELPERS_H
 
 #include <string.h>
+#include <stdlib.h>
 #include <ctype.h>
 #include <sys/stat.h>
+
+/* Quick error return for tool functions */
+#define TOOL_ERROR(msg) do { *error = _strdup(msg); return NULL; } while(0)
 
 #ifdef _WIN32
 #include <direct.h>

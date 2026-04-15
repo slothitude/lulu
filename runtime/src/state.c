@@ -2,8 +2,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "state.h"
 #include "cJSON.h"
+
+/* ========================= ISO 8601 Timestamp ========================= */
+
+static void get_iso8601(char *buf, size_t size) {
+    time_t now = time(NULL);
+    struct tm *t = gmtime(&now);
+    snprintf(buf, size, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+             t->tm_hour, t->tm_min, t->tm_sec);
+}
 
 /* ========================= File I/O ========================= */
 
@@ -229,11 +240,18 @@ void memory_track_file(WorkingMemory *mem, const char *path) {
 /* ========================= JSONL Logging ========================= */
 
 void state_log_step(const char *log_path, int step_id, const char *tool,
-                    cJSON *args, cJSON *result, int success) {
+                    cJSON *args, cJSON *result, int success,
+                    int iteration, const char *stage) {
     FILE *f = fopen(log_path, "a");
     if (!f) return;
 
+    char ts[32];
+    get_iso8601(ts, sizeof(ts));
+
     cJSON *entry = cJSON_CreateObject();
+    cJSON_AddStringToObject(entry, "ts", ts);
+    cJSON_AddNumberToObject(entry, "iter", iteration);
+    cJSON_AddStringToObject(entry, "stage", stage ? stage : "actor");
     cJSON_AddNumberToObject(entry, "step", step_id);
     cJSON_AddStringToObject(entry, "tool", tool ? tool : "none");
     cJSON_AddBoolToObject(entry, "success", success);
@@ -246,6 +264,29 @@ void state_log_step(const char *log_path, int step_id, const char *tool,
         cJSON *res_copy = cJSON_Duplicate(result, 1);
         cJSON_AddItemToObject(entry, "result", res_copy);
     }
+
+    char *json = cJSON_PrintUnformatted(entry);
+    fprintf(f, "%s\n", json);
+
+    free(json);
+    cJSON_Delete(entry);
+    fclose(f);
+}
+
+void state_log_stage(const char *log_path, int iteration, const char *stage,
+                     const char *summary, int success) {
+    FILE *f = fopen(log_path, "a");
+    if (!f) return;
+
+    char ts[32];
+    get_iso8601(ts, sizeof(ts));
+
+    cJSON *entry = cJSON_CreateObject();
+    cJSON_AddStringToObject(entry, "ts", ts);
+    cJSON_AddNumberToObject(entry, "iter", iteration);
+    cJSON_AddStringToObject(entry, "stage", stage ? stage : "unknown");
+    cJSON_AddStringToObject(entry, "summary", summary ? summary : "");
+    cJSON_AddBoolToObject(entry, "success", success);
 
     char *json = cJSON_PrintUnformatted(entry);
     fprintf(f, "%s\n", json);

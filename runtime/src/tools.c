@@ -83,6 +83,11 @@ int tools_load_all(const char *dir) {
         t->fn = fn;
         t->enabled = 1;
         t->handle = (void *)lib;
+        t->requires_workspace = info->requires_workspace;
+        t->is_idempotent = info->is_idempotent;
+        t->has_side_effects = info->has_side_effects;
+        if (info->description)
+            strncpy(t->description, info->description, sizeof(t->description) - 1);
         g_tool_count++;
 
         fprintf(stderr, "[TOOLS] Loaded: %s\n", info->name);
@@ -110,6 +115,26 @@ const LoadedTool *tools_find(const char *name) {
             return &g_tools[i];
     }
     return NULL;
+}
+
+char *tools_get_enabled_names(void) {
+    /* Calculate needed size */
+    size_t len = 1;
+    for (int i = 0; i < g_tool_count; i++) {
+        if (g_tools[i].enabled) {
+            len += strlen(g_tools[i].name) + 1; /* name + ';' */
+        }
+    }
+    char *buf = (char *)malloc(len);
+    if (!buf) return NULL;
+    buf[0] = 0;
+    for (int i = 0; i < g_tool_count; i++) {
+        if (g_tools[i].enabled) {
+            if (buf[0]) strcat(buf, ";");
+            strcat(buf, g_tools[i].name);
+        }
+    }
+    return buf;
 }
 
 void tools_cleanup(void) {

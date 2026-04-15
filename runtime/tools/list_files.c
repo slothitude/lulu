@@ -64,7 +64,14 @@ static cJSON *list_files(cJSON *args, const char *workspace, char **error) {
     return r;
 }
 
-static ToolInfo info = { "list_files", "List all files in workspace" };
+static ToolInfo info = {
+    "list_files",
+    "List all files in workspace",
+    "1.0",
+    1,  /* requires_workspace */
+    1,  /* is_idempotent */
+    0   /* has_side_effects */
+};
 
 TOOL_EXPORT const ToolInfo *tool_get_info(void) { return &info; }
 TOOL_EXPORT tool_execute_fn tool_get_execute(void) { return list_files; }

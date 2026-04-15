@@ -56,6 +56,8 @@
     "confidence_threshold": 0.7,
     "stuck_hint": "previous strategy failed, try a completely different approach",
     "actor_max_attempts": 3,
-    "critic_log_tail_bytes": 2048
+    "critic_log_tail_bytes": 2048,
+    "dry_run": false,
+    "max_steps_per_iteration": 0
   }
 }

@@ -31,6 +31,62 @@ static void print_banner(void) {
     printf("========================================\n\n");
 }
 
+/* ========================= Replay Mode ========================= */
+
+static int run_replay(const char *log_path) {
+    FILE *f = fopen(log_path, "r");
+    if (!f) {
+        fprintf(stderr, "[REPLAY] Cannot open %s\n", log_path);
+        return 1;
+    }
+
+    char line[8192];
+    int count = 0;
+    printf("[REPLAY] Log: %s\n\n", log_path);
+
+    while (fgets(line, sizeof(line), f)) {
+        /* Strip trailing newline */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
+        if (len == 0) continue;
+
+        cJSON *entry = cJSON_Parse(line);
+        if (!entry) continue;
+
+        cJSON *ts_item    = cJSON_GetObjectItem(entry, "ts");
+        cJSON *iter_item  = cJSON_GetObjectItem(entry, "iter");
+        cJSON *stage_item = cJSON_GetObjectItem(entry, "stage");
+        cJSON *step_item  = cJSON_GetObjectItem(entry, "step");
+        cJSON *tool_item  = cJSON_GetObjectItem(entry, "tool");
+        cJSON *succ_item  = cJSON_GetObjectItem(entry, "success");
+        cJSON *sum_item   = cJSON_GetObjectItem(entry, "summary");
+
+        const char *ts    = cJSON_IsString(ts_item)    ? ts_item->valuestring    : "?";
+        int         iter  = cJSON_IsNumber(iter_item)  ? iter_item->valueint     : 0;
+        const char *stage = cJSON_IsString(stage_item) ? stage_item->valuestring : "?";
+
+        if (sum_item && cJSON_IsString(sum_item)) {
+            /* Stage event (planner/critic) */
+            printf("[%s] %s | iter=%d | %s\n", ts, stage, iter, sum_item->valuestring);
+        } else {
+            /* Actor step event */
+            const char *tool = cJSON_IsString(tool_item) ? tool_item->valuestring : "?";
+            int step = cJSON_IsNumber(step_item) ? step_item->valueint : 0;
+            int success = cJSON_IsBool(succ_item) ? succ_item->valueint : 0;
+
+            printf("[%s] %s | iter=%d step=%d | tool=%s | %s\n",
+                   ts, stage, iter, step, tool, success ? "OK" : "FAIL");
+        }
+
+        cJSON_Delete(entry);
+        count++;
+    }
+
+    fclose(f);
+    printf("\n[REPLAY] %d entries displayed\n", count);
+    return 0;
+}
+
 static void print_step_header(int iteration, int step_id, const char *task) {
     printf("[ITER %d | STEP %d] %s\n", iteration, step_id, task);
 }
@@ -58,6 +114,14 @@ static void print_summary(WorkingMemory *mem, int iterations) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Check for --replay flag */
+    int replay_mode = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--replay") == 0) {
+            replay_mode = 1;
+        }
+    }
+
     print_banner();
 
     char base_dir[MAX_PATH];
@@ -87,9 +151,14 @@ int main(int argc, char *argv[]) {
     snprintf(agent_cfg_path, MAX_PATH, "%s\\agent.json", base_dir);
     snprintf(goal_path, MAX_PATH, "%s\\state\\info.md", base_dir);
     snprintf(workspace_path, MAX_PATH, "%s\\workspace", base_dir);
-    snprintf(log_path, MAX_PATH, "%s\\state\\log.txt", base_dir);
+    snprintf(log_path, MAX_PATH, "%s\\state\\log.jsonl", base_dir);
     snprintf(memory_path, MAX_PATH, "%s\\state\\memory.json", base_dir);
     snprintf(tools_dir, MAX_PATH, "%s\\tools", base_dir);
+
+    /* Replay mode: read log and exit, no LLM calls */
+    if (replay_mode) {
+        return run_replay(log_path);
+    }
 
     /* Load LLM config */
     Config cfg;
@@ -127,6 +196,33 @@ int main(int argc, char *argv[]) {
         tools_set_enabled(g_agent_cfg.tool_flags[i].name, g_agent_cfg.tool_flags[i].enabled);
         if (!g_agent_cfg.tool_flags[i].enabled) {
             printf("[INIT] Tool disabled: %s\n", g_agent_cfg.tool_flags[i].name);
+        }
+    }
+
+    /* Build dynamic tools_list from loaded+enabled DLLs */
+    {
+        char *names = tools_get_enabled_names();
+        if (names) {
+            char list_buf[AC_MAX_TEXT];
+            list_buf[0] = 0;
+            char *save = NULL;
+            char *name = strtok_s(names, ";", &save);
+            int first = 1;
+            while (name) {
+                const LoadedTool *lt = tools_find(name);
+                if (lt) {
+                    if (!first) strcat(list_buf, "\n");
+                    char entry[512];
+                    snprintf(entry, sizeof(entry), "- %s: %s", lt->name,
+                             lt->description[0] ? lt->description : "No description");
+                    strcat(list_buf, entry);
+                    first = 0;
+                }
+                name = strtok_s(NULL, ";", &save);
+            }
+            strncpy(g_agent_cfg.shared.tools_list, list_buf, sizeof(g_agent_cfg.shared.tools_list) - 1);
+            free(names);
+            printf("[INIT] Dynamic tools_list: %s\n", g_agent_cfg.shared.tools_list);
         }
     }
 
@@ -197,6 +293,13 @@ int main(int argc, char *argv[]) {
             needs_plan = 0;
             planner_hint[0] = 0;
 
+            /* Log planner stage */
+            {
+                char plan_summary[256];
+                snprintf(plan_summary, sizeof(plan_summary), "Planned %d steps", step_count);
+                state_log_stage(log_path, iter, "planner", plan_summary, 1);
+            }
+
             printf("[PLAN] %d steps:\n", step_count);
             for (int i = 0; i < step_count; i++) {
                 printf("  %d. %s\n", steps[i].id, steps[i].task);
@@ -208,11 +311,18 @@ int main(int argc, char *argv[]) {
         if (has_actor) {
             int step_failed = 0;
             for (int s = 0; s < step_count; s++) {
+                /* Enforce max_steps_per_iteration cap */
+                int max_s = g_agent_cfg.behavior.max_steps_per_iteration;
+                if (max_s > 0 && s >= max_s) {
+                    printf("[ORCH] max_steps_per_iteration (%d) reached, skipping remaining steps\n", max_s);
+                    break;
+                }
+
                 print_step_header(iter, steps[s].id, steps[s].task);
 
                 ActorResult ar = actor_run(&steps[s], &mem, workspace_path);
 
-                state_log_step(log_path, steps[s].id, ar.tool, ar.args, ar.result, ar.success);
+                state_log_step(log_path, steps[s].id, ar.tool, ar.args, ar.result, ar.success, iter, "actor");
 
                 print_result(ar.tool, ar.result, ar.success);
 
@@ -259,6 +369,9 @@ int main(int argc, char *argv[]) {
         /* CRITIC (if enabled) */
         if (has_critic) {
             CriticResult critic = critic_run(log_path, &mem, goal);
+
+            /* Log critic stage */
+            state_log_stage(log_path, iter, "critic", critic.summary[0] ? critic.summary : critic.status, 1);
 
             printf("\n[CRITIC] %s (progress=%.0f%%, confidence=%.0f%%)\n",
                    critic.status, critic.progress * 100, critic.confidence * 100);

@@ -16,6 +16,10 @@
 typedef struct {
     const char *name;
     const char *description;
+    const char *api_version;       /* "1.0" */
+    int requires_workspace;
+    int is_idempotent;             /* safe to retry */
+    int has_side_effects;
 } ToolInfo;
 
 typedef cJSON *(*tool_execute_fn)(cJSON *args, const char *workspace, char **error);
