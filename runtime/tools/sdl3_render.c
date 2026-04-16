@@ -6,6 +6,10 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include "tool_api.h"
 #include "tool_helpers.h"
 #include "sandbox.h"
