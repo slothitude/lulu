@@ -66,14 +66,19 @@ jobs:
           echo "Patched local_file_system.cpp"
 
           # 4. buffer_manager.cpp — guard SEH with _MSC_VER
-          #    Two blocks to guard:
-          #    a) #if defined(_WIN32) that includes <exception>/<eh.h>  (line ~22)
-          #    b) #if defined(WIN32) that defines AccessViolation class (line ~154)
+          #    The SEH classes are under #if defined(WIN32). We need to add && defined(_MSC_VER)
+          #    ONLY to the one before "class AccessViolation", not all WIN32 guards.
           BM=src/storage/buffer_manager/buffer_manager.cpp
-          # Guard the include block
+          # Use awk to only change the #if defined(WIN32) that appears exactly before "class AccessViolation"
+          awk '
+          /^#if defined\(WIN32\)$/ { prev=$0; next }
+          /^class AccessViolation/ { if (prev == "#if defined(WIN32)") print "#if defined(WIN32) && defined(_MSC_VER)"; else print prev; prev=""; print; next }
+          prev != "" { print prev; prev="" }
+          { print }
+          END { if (prev != "") print prev }
+          ' "$BM" > "$BM.tmp" && mv "$BM.tmp" "$BM"
+          # Also guard the include of <exception> and <eh.h>
           sed -i '/^#if defined(_WIN32)$/{ N; /\n#include <exception>/{ s/^#if defined(_WIN32)/#if defined(_WIN32) \&\& defined(_MSC_VER)/; }; }' "$BM"
-          # Guard the SEH class block (uses WIN32 without underscore)
-          sed -i 's/^#if defined(WIN32)$/#if defined(WIN32) \&\& defined(_MSC_VER)/' "$BM"
           echo "Patched buffer_manager.cpp"
 
           # 5. glob.hpp — replace _dupenv_s with getenv for MinGW
