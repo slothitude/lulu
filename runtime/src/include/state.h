@@ -63,17 +63,18 @@ void memory_track_file(WorkingMemory *mem, const char *path);
 /* Append a JSONL log entry */
 void state_log_step(const char *log_path, int step_id, const char *tool,
                     cJSON *args, cJSON *result, int success,
-                    int iteration, const char *stage);
+                    int iteration, const char *stage, const char *task_id);
 
 /* Log a planner/critic stage event */
 void state_log_stage(const char *log_path, int iteration, const char *stage,
-                     const char *summary, int success);
+                     const char *summary, int success, const char *task_id);
 
 /* Log a raw LLM interaction */
 void state_log_llm(const char *log_path, int iteration, const char *stage,
                    const char *prompt_summary, const char *raw_response,
                    const char *parsed_json, int success,
-                   const char *prompt_hash, int cache_hit);
+                   const char *prompt_hash, int cache_hit,
+                   const char *task_id);
 
 /* Read entire file into malloc'd buffer. Returns NULL on failure. */
 char *read_file_contents(const char *path);

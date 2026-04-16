@@ -77,7 +77,8 @@ Task *tasks_create(const char *prompt, const char *source,
     free(id);
     if (!dbt) return NULL;
 
-    return (Task *)cache_add(dbt);
+    Task *result = (Task *)cache_add(dbt);
+    return result;
 }
 
 Task *tasks_next_runnable(void) {

@@ -7,6 +7,7 @@
 
 #include "state.h"
 #include "agent_db.h"
+#include "llm.h"
 #include "cJSON.h"
 
 extern AgentDB g_adb;
@@ -169,7 +170,17 @@ void memory_update(WorkingMemory *mem, const char *tool, const char *result, int
 
     /* Track errors in graph */
     if (!success && result) {
-        agent_db_memory_add(&g_adb, "error", "", result);
+        char *mem_id = agent_db_memory_add(&g_adb, "error", "", result);
+        /* Generate embedding for error memory (graceful fallback) */
+        if (mem_id) {
+            int dim = 0;
+            float *vec = llm_embed(result, &dim);
+            if (vec) {
+                agent_db_memory_store_embedding(&g_adb, mem_id, vec, dim);
+                free(vec);
+            }
+            free(mem_id);
+        }
     }
 }
 
@@ -185,7 +196,7 @@ void memory_track_file(WorkingMemory *mem, const char *path) {
 
 void state_log_step(const char *log_path, int step_id, const char *tool,
                     cJSON *args, cJSON *result, int success,
-                    int iteration, const char *stage) {
+                    int iteration, const char *stage, const char *task_id) {
     /* Log to graph */
     cJSON *entry = cJSON_CreateObject();
     cJSON_AddStringToObject(entry, "tool", tool ? tool : "none");
@@ -194,7 +205,7 @@ void state_log_step(const char *log_path, int step_id, const char *tool,
     if (result) cJSON_AddItemToObject(entry, "result", cJSON_Duplicate(result, 1));
     char *json = cJSON_PrintUnformatted(entry);
     agent_db_log_event(&g_adb, "tool_step", iteration, stage ? stage : "actor",
-                       json, success);
+                       json, success, task_id);
     free(json);
     cJSON_Delete(entry);
 
@@ -219,9 +230,9 @@ void state_log_step(const char *log_path, int step_id, const char *tool,
 }
 
 void state_log_stage(const char *log_path, int iteration, const char *stage,
-                     const char *summary, int success) {
+                     const char *summary, int success, const char *task_id) {
     agent_db_log_event(&g_adb, "stage", iteration, stage ? stage : "unknown",
-                       summary, success);
+                       summary, success, task_id);
 
     FILE *f = fopen(log_path, "a");
     if (!f) return;
@@ -240,14 +251,15 @@ void state_log_stage(const char *log_path, int iteration, const char *stage,
 void state_log_llm(const char *log_path, int iteration, const char *stage,
                    const char *prompt_summary, const char *raw_response,
                    const char *parsed_json, int success,
-                   const char *prompt_hash, int cache_hit) {
+                   const char *prompt_hash, int cache_hit,
+                   const char *task_id) {
     cJSON *entry = cJSON_CreateObject();
     cJSON_AddStringToObject(entry, "prompt_summary", prompt_summary ? prompt_summary : "");
     if (prompt_hash) cJSON_AddStringToObject(entry, "prompt_hash", prompt_hash);
     cJSON_AddBoolToObject(entry, "cache_hit", cache_hit ? 1 : 0);
     char *json = cJSON_PrintUnformatted(entry);
     agent_db_log_event(&g_adb, "llm", iteration, stage ? stage : "unknown",
-                       json, success);
+                       json, success, task_id);
     free(json); cJSON_Delete(entry);
 
     /* JSONL file */

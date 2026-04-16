@@ -54,6 +54,15 @@ static void cli_init(void) {
 /* Non-blocking check: is there data on stdin? */
 static int cli_has_data(int timeout_ms) {
     if (!g_cli_initialized) return 0;
+    /* For pipes, WaitForSingleObject may not signal correctly.
+       Use PeekNamedPipe to check for available data. */
+    DWORD bytes_avail = 0;
+    if (PeekNamedPipe(g_stdin_handle, NULL, 0, NULL, &bytes_avail, NULL)) {
+        return (bytes_avail > 0);
+    }
+    /* Pipe closed or error — stop polling */
+    if (GetLastError() == ERROR_BROKEN_PIPE) return 0;
+    /* Fallback for console */
     DWORD result = WaitForSingleObject(g_stdin_handle, timeout_ms);
     return (result == WAIT_OBJECT_0);
 }
@@ -96,6 +105,7 @@ int channels_poll(double timeout) {
 
     /* 1. Poll CLI (quick non-blocking check) */
     if (cli_has_data(0)) {
+        fprintf(stderr, "[CLI] Data available on stdin\n");
         char buf[CH_EVENT_TEXT_MAX];
         if (cli_read_line(buf, sizeof(buf))) {
             AgentEvent ev = {0};
@@ -106,6 +116,7 @@ int channels_poll(double timeout) {
             /* Detect commands vs messages */
             if (ev.text[0] == '/') {
                 strncpy(ev.action, "command", sizeof(ev.action) - 1);
+                fprintf(stderr, "[CLI] Command: %s\n", ev.text);
             } else {
                 strncpy(ev.action, "message", sizeof(ev.action) - 1);
             }

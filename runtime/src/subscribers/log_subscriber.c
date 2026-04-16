@@ -14,7 +14,7 @@ static int on_tool_result(const Event *ev, void *ud) {
     (void)ud;
     state_log_step(g_log_path, ev->tool_result.step_id, ev->tool_result.tool,
                    (cJSON *)ev->tool_result.args, (cJSON *)ev->tool_result.result,
-                   ev->tool_result.success, ev->tool_result.iteration, "actor");
+                   ev->tool_result.success, ev->tool_result.iteration, "actor", NULL);
     return 0;
 }
 
@@ -22,7 +22,7 @@ static int on_state_update(const Event *ev, void *ud) {
     (void)ud;
     state_log_stage(g_log_path, ev->state_update.iteration,
                     ev->state_update.stage, ev->state_update.summary,
-                    ev->state_update.success);
+                    ev->state_update.success, NULL);
     return 0;
 }
 
@@ -31,14 +31,14 @@ static int on_llm_call(const Event *ev, void *ud) {
     state_log_llm(g_log_path, ev->llm_call.iteration, ev->llm_call.stage,
                   ev->llm_call.prompt_summary, ev->llm_call.raw_response,
                   ev->llm_call.parsed_json, ev->llm_call.success,
-                  ev->llm_call.prompt_hash, ev->llm_call.cache_hit);
+                  ev->llm_call.prompt_hash, ev->llm_call.cache_hit, NULL);
     return 0;
 }
 
 static int on_done(const Event *ev, void *ud) {
     (void)ud;
     state_log_stage(g_log_path, ev->done.iteration, "done",
-                    ev->done.summary, ev->done.success);
+                    ev->done.summary, ev->done.success, NULL);
     return 0;
 }
 

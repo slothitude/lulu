@@ -142,8 +142,9 @@ static char *execute_tool(const char *tool_name, cJSON *args, const char *worksp
 }
 
 /* Try to parse LLM response as tool call. Returns result if tool call, NULL otherwise.
-   Sets *is_tool. */
-static char *try_tool_call(const char *response, const char *workspace, int *is_tool) {
+   Sets *is_tool. task_id is NULL for conversational path (no recording). */
+static char *try_tool_call(const char *response, const char *workspace, int *is_tool,
+                           const char *task_id) {
     cJSON *json = cJSON_Parse(response);
     if (!json) { *is_tool = 0; return NULL; }
 
@@ -158,7 +159,23 @@ static char *try_tool_call(const char *response, const char *workspace, int *is_
     cJSON *args = cJSON_GetObjectItem(json, "arguments");
     if (!args) args = cJSON_CreateObject();
 
+    /* Time the tool execution if recording */
+    ULONGLONG t0 = 0;
+    if (task_id) t0 = GetTickCount64();
+
     char *result_str = execute_tool(tool_name, args, workspace);
+
+    if (task_id) {
+        int64_t dur_ms = (int64_t)(GetTickCount64() - t0);
+        char *args_json = cJSON_PrintUnformatted(args);
+        agent_db_lock();
+        char *tc_id = agent_db_tool_call_record(&g_adb, task_id, tool_name,
+                                  args_json, result_str, dur_ms);
+        agent_db_unlock();
+        if (tc_id) free(tc_id);
+        free(args_json);
+    }
+
     cJSON_Delete(json);
     *is_tool = 1;
     return result_str;
@@ -167,15 +184,17 @@ static char *try_tool_call(const char *response, const char *workspace, int *is_
 /* ========================= Chat with Tool Loop ========================= */
 
 /* Run LLM → tool → LLM loop until text response or MAX_TOOL_STEPS.
-   Adds messages to session history. Returns final text reply (malloc'd) or NULL. */
-static char *chat_with_tools(ChatSession *session, const char *workspace) {
+   Adds messages to session history. Returns final text reply (malloc'd) or NULL.
+   task_id is NULL for conversational path (no tool recording). */
+static char *chat_with_tools(ChatSession *session, const char *workspace,
+                             const char *task_id) {
     for (int step = 0; step < MAX_TOOL_STEPS; step++) {
         char *reply = llm_chat_multi(session->history, session->hist_count, 3);
         if (!reply) return NULL;
 
         /* Check if it's a tool call */
         int is_tool = 0;
-        char *tool_result = try_tool_call(reply, workspace, &is_tool);
+        char *tool_result = try_tool_call(reply, workspace, &is_tool, task_id);
 
         if (is_tool && tool_result) {
             /* Add assistant + tool result to history, loop */
@@ -250,8 +269,6 @@ static void execute_task(Task *t, const char *workspace) {
     t->updated_at = time(NULL);
     tasks_save();
     tasks_unlock();
-
-    /* Create temporary session for this task */
     long long task_chat_id = t->chat_id ? t->chat_id : 0;
     session_lock();
     ChatSession *session = session_get_or_create(task_chat_id + 1000000); /* offset to avoid collision */
@@ -261,8 +278,6 @@ static void execute_task(Task *t, const char *workspace) {
     /* Clear and rebuild session for this task */
     session_clear(task_chat_id + 1000000);
     session_unlock();
-
-    /* Re-add system prompt */
     if (session->hist_count >= SESSION_HISTORY) {
         free(session->history[0].content);
         memmove(&session->history[0], &session->history[1],
@@ -274,14 +289,112 @@ static void execute_task(Task *t, const char *workspace) {
     sm->content = _strdup(sys_prompt);
     session->hist_count++;
 
-    /* Build prompt with context from previous attempts */
-    char user_msg[TASK_PROMPT_MAX + TASK_STATE_MAX + 512];
+    /* Build prompt with context from previous attempts + semantic memory */
+    char user_msg[TASK_PROMPT_MAX + TASK_STATE_MAX + 2048];
+    int upos = 0;
+
+    /* Semantic memory search: embed prompt, find relevant past experiences */
+    {
+        int emb_dim = 0;
+        float *qvec = llm_embed(t->prompt, &emb_dim);
+        if (qvec) {
+            agent_db_lock();
+            cJSON *mems = agent_db_memory_search(&g_adb, qvec, emb_dim, 5);
+            agent_db_unlock();
+            int nm = cJSON_GetArraySize(mems);
+            if (nm > 0) {
+                upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
+                    "Relevant past experiences:\n");
+                for (int i = 0; i < nm; i++) {
+                    cJSON *m = cJSON_GetArrayItem(mems, i);
+                    cJSON *mc = cJSON_GetObjectItem(m, "content");
+                    if (cJSON_IsString(mc) && mc->valuestring[0]) {
+                        upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
+                            "- %s\n", mc->valuestring);
+                    }
+                }
+                upos += snprintf(user_msg + upos, sizeof(user_msg) - upos, "\n");
+            }
+            cJSON_Delete(mems);
+            free(qvec);
+        }
+    }
+
+    /* Script match: find similar past workflows */
+    {
+        agent_db_lock();
+        cJSON *scripts = agent_db_script_match(&g_adb, t->prompt);
+        agent_db_unlock();
+        int ns = cJSON_GetArraySize(scripts);
+        if (ns > 0) {
+            upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
+                "Similar past workflows:\n");
+            for (int i = 0; i < ns; i++) {
+                cJSON *s = cJSON_GetArrayItem(scripts, i);
+                cJSON *sseq = cJSON_GetObjectItem(s, "tool_sequence");
+                cJSON *sn = cJSON_GetObjectItem(s, "name");
+                if (cJSON_IsString(sseq) && sseq->valuestring[0]) {
+                    upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
+                        "- %s: %s\n",
+                        cJSON_IsString(sn) ? sn->valuestring : "?",
+                        sseq->valuestring);
+                }
+            }
+            upos += snprintf(user_msg + upos, sizeof(user_msg) - upos, "\n");
+        }
+        cJSON_Delete(scripts);
+    }
+
+    /* File workflow context: detect file paths in prompt */
+    {
+        const char *p = t->prompt;
+        while (*p) {
+            /* Simple heuristic: look for filename-like patterns */
+            const char *dot = strchr(p, '.');
+            if (!dot) break;
+            /* Check if this looks like a filename (has extension after dot) */
+            const char *start = dot;
+            while (start > p && start[-1] != ' ' && start[-1] != '\n' && start[-1] != '\'' && start[-1] != '"')
+                start--;
+            const char *end = dot + 1;
+            while (*end && *end != ' ' && *end != '\n' && *end != ',' && *end != ')' && *end != '\'')
+                end++;
+            if (end - start > 3 && end - dot > 1) {
+                char fpath[256];
+                size_t flen = end - start;
+                if (flen > 255) flen = 255;
+                memcpy(fpath, start, flen); fpath[flen] = 0;
+
+                agent_db_lock();
+                cJSON *wf = agent_db_file_workflow(&g_adb, fpath);
+                agent_db_unlock();
+                int nw = cJSON_GetArraySize(wf);
+                if (nw > 0) {
+                    upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
+                        "File '%s' was previously touched by tasks: ", fpath);
+                    for (int i = 0; i < nw && i < 5; i++) {
+                        cJSON *w = cJSON_GetArrayItem(wf, i);
+                        cJSON *wid = cJSON_GetObjectItem(w, "task_id");
+                        if (cJSON_IsString(wid))
+                            upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
+                                "%s%s", i ? ", " : "", wid->valuestring);
+                    }
+                    upos += snprintf(user_msg + upos, sizeof(user_msg) - upos, "\n");
+                }
+                cJSON_Delete(wf);
+                p = end;
+            } else {
+                p = dot + 1;
+            }
+        }
+    }
+
     if (t->state[0]) {
-        snprintf(user_msg, sizeof(user_msg),
+        upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
             "Task: %s\n\nPrevious context:\n%s\n\nContinue this task. What's been done so far is noted above.",
             t->prompt, t->state);
     } else {
-        snprintf(user_msg, sizeof(user_msg), "Task: %s", t->prompt);
+        upos += snprintf(user_msg + upos, sizeof(user_msg) - upos, "Task: %s", t->prompt);
     }
 
     if (session->hist_count >= SESSION_HISTORY) {
@@ -296,7 +409,7 @@ static void execute_task(Task *t, const char *workspace) {
     session->hist_count++;
 
     /* Run tool loop */
-    char *result = chat_with_tools(session, workspace);
+    char *result = chat_with_tools(session, workspace, t->id);
 
     if (result) {
         /* Check if LLM thinks it's done */
@@ -313,6 +426,17 @@ static void execute_task(Task *t, const char *workspace) {
             tasks_unlock();
             printf("[TASK] %s completed: %.100s\n", t->id, result);
             channels_reply(t->chat_id, result);
+
+            /* Extract workflow script from completed task */
+            {
+                agent_db_lock();
+                char *script_name = agent_db_task_extract_script(&g_adb, t->id);
+                agent_db_unlock();
+                if (script_name) {
+                    printf("[TASK] Extracted script: %s\n", script_name);
+                    free(script_name);
+                }
+            }
         } else {
             tasks_lock();
             tasks_append_state(t, result);
@@ -344,7 +468,7 @@ static void execute_task(Task *t, const char *workspace) {
 
     /* Log task execution */
     state_log_stage(g_log_path, t->attempts, "task",
-                    t->prompt, strcmp(t->status, "done") == 0);
+                    t->prompt, strcmp(t->status, "done") == 0, t->id);
 
     /* Decision engine learning */
     decision_learn(t->id, strcmp(t->status, "done") == 0);
@@ -495,6 +619,99 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
         return;
     }
 
+    if (strcmp(text, "/scripts") == 0) {
+        agent_db_lock();
+        ryu_query_result result;
+        const char *sq = "MATCH (s:SCRIPT) RETURN s.name, s.tool_sequence, s.success_count "
+                         "ORDER BY s.success_count DESC LIMIT 20";
+        ryu_state st = ryu_connection_query(&g_adb._conn, sq, &result);
+        if (st != RyuSuccess || !ryu_query_result_is_success(&result)) {
+            ryu_query_result_destroy(&result);
+            agent_db_unlock();
+            channels_reply(ev->chat_id, "Query failed.");
+            return;
+        }
+        char buf[4096]; buf[0] = 0;
+        size_t pos = 0;
+        while (ryu_query_result_has_next(&result) && pos < sizeof(buf) - 256) {
+            ryu_flat_tuple tuple;
+            ryu_query_result_get_next(&result, &tuple);
+            for (uint64_t c = 0; c < 3; c++) {
+                ryu_value val;
+                ryu_flat_tuple_get_value(&tuple, c, &val);
+                if (ryu_value_is_null(&val)) {
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, "NULL\t");
+                } else {
+                    char *s = NULL;
+                    ryu_value_get_string(&val, &s);
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\t", s ? s : "");
+                    if (s) ryu_destroy_string(s);
+                }
+                ryu_value_destroy(&val);
+            }
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
+            ryu_flat_tuple_destroy(&tuple);
+        }
+        ryu_query_result_destroy(&result);
+        agent_db_unlock();
+        channels_reply(ev->chat_id, buf[0] ? buf : "(no scripts)");
+        return;
+    }
+
+    if (strncmp(text, "/replay ", 8) == 0) {
+        const char *task_id = text + 8;
+        if (!task_id[0]) {
+            channels_reply(ev->chat_id, "Usage: /replay <task_id>");
+            return;
+        }
+        agent_db_lock();
+        char rq[512];
+        snprintf(rq, sizeof(rq),
+            "MATCH (t:TASK {id:'%s'})-[:CALLED]->(tc:TOOL_CALL) "
+            "RETURN tc.tool, tc.args_json, tc.result_json, tc.duration_ms "
+            "ORDER BY tc.created_at", task_id);
+        ryu_query_result result;
+        ryu_state rst = ryu_connection_query(&g_adb._conn, rq, &result);
+        if (rst != RyuSuccess || !ryu_query_result_is_success(&result)) {
+            char *err = ryu_query_result_get_error_message(&result);
+            char msg[512];
+            snprintf(msg, sizeof(msg), "Query failed: %s", err ? err : "unknown");
+            if (err) ryu_destroy_string(err);
+            channels_reply(ev->chat_id, msg);
+            ryu_query_result_destroy(&result);
+            agent_db_unlock();
+            return;
+        }
+        char buf[4096]; buf[0] = 0;
+        size_t rpos = 0;
+        while (ryu_query_result_has_next(&result) && rpos < sizeof(buf) - 256) {
+            ryu_flat_tuple tuple;
+            ryu_query_result_get_next(&result, &tuple);
+            char *tool = NULL, *dur = NULL;
+            {
+                ryu_value val;
+                ryu_flat_tuple_get_value(&tuple, 0, &val);
+                if (!ryu_value_is_null(&val)) ryu_value_get_string(&val, &tool);
+                ryu_value_destroy(&val);
+            }
+            {
+                ryu_value val;
+                ryu_flat_tuple_get_value(&tuple, 3, &val);
+                if (!ryu_value_is_null(&val)) ryu_value_get_string(&val, &dur);
+                ryu_value_destroy(&val);
+            }
+            rpos += snprintf(buf + rpos, sizeof(buf) - rpos,
+                "TOOL: %s  (%sms)\n", tool ? tool : "?", dur ? dur : "?");
+            if (tool) ryu_destroy_string(tool);
+            if (dur) ryu_destroy_string(dur);
+            ryu_flat_tuple_destroy(&tuple);
+        }
+        ryu_query_result_destroy(&result);
+        agent_db_unlock();
+        channels_reply(ev->chat_id, buf[0] ? buf : "(no tool calls found)");
+        return;
+    }
+
     if (strncmp(text, "/goal ", 6) == 0) {
         const char *goal_text = text + 6;
         if (!goal_text[0]) {
@@ -528,9 +745,100 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
         return;
     }
 
+    if (strncmp(text, "/history ", 9) == 0) {
+        int n = atoi(text + 9);
+        if (n <= 0) n = 10;
+        if (n > 100) n = 100;
+        agent_db_lock();
+        char q[256];
+        snprintf(q, sizeof(q),
+            "MATCH (e:LOG_EVENT) RETURN e.type, e.stage, e.success, e.created_at "
+            "ORDER BY e.created_at DESC LIMIT %d", n);
+        ryu_query_result result;
+        ryu_state st = ryu_connection_query(&g_adb._conn, q, &result);
+        if (st != RyuSuccess || !ryu_query_result_is_success(&result)) {
+            ryu_query_result_destroy(&result);
+            agent_db_unlock();
+            channels_reply(ev->chat_id, "Query failed.");
+            return;
+        }
+        char buf[4096]; buf[0] = 0;
+        size_t pos = 0;
+        while (ryu_query_result_has_next(&result) && pos < sizeof(buf) - 128) {
+            ryu_flat_tuple tuple;
+            ryu_query_result_get_next(&result, &tuple);
+            char *type = NULL, *stage = NULL, *success = NULL, *ts = NULL;
+            {
+                ryu_value val; ryu_flat_tuple_get_value(&tuple, 0, &val);
+                if (!ryu_value_is_null(&val)) ryu_value_get_string(&val, &type);
+                ryu_value_destroy(&val);
+            }
+            {
+                ryu_value val; ryu_flat_tuple_get_value(&tuple, 1, &val);
+                if (!ryu_value_is_null(&val)) ryu_value_get_string(&val, &stage);
+                ryu_value_destroy(&val);
+            }
+            {
+                ryu_value val; ryu_flat_tuple_get_value(&tuple, 2, &val);
+                if (!ryu_value_is_null(&val)) ryu_value_get_string(&val, &success);
+                ryu_value_destroy(&val);
+            }
+            {
+                ryu_value val; ryu_flat_tuple_get_value(&tuple, 3, &val);
+                if (!ryu_value_is_null(&val)) ryu_value_get_string(&val, &ts);
+                ryu_value_destroy(&val);
+            }
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "[%s] %s/%s %s\n",
+                ts ? ts : "?", type ? type : "?", stage ? stage : "?",
+                (success && success[0] == 't') ? "OK" : "FAIL");
+            if (type) ryu_destroy_string(type);
+            if (stage) ryu_destroy_string(stage);
+            if (success) ryu_destroy_string(success);
+            if (ts) ryu_destroy_string(ts);
+            ryu_flat_tuple_destroy(&tuple);
+        }
+        ryu_query_result_destroy(&result);
+        agent_db_unlock();
+        channels_reply(ev->chat_id, buf[0] ? buf : "(no history)");
+        return;
+    }
+
+    if (strncmp(text, "/diff ", 6) == 0) {
+        const char *args = text + 6;
+        char id_a[64] = "", id_b[64] = "";
+        if (sscanf(args, "%63s %63s", id_a, id_b) != 2) {
+            channels_reply(ev->chat_id, "Usage: /diff <task_id1> <task_id2>");
+            return;
+        }
+        agent_db_lock();
+        cJSON *diff = agent_db_task_diff(&g_adb, id_a, id_b);
+        agent_db_unlock();
+        char buf[2048]; buf[0] = 0;
+        size_t pos = 0;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "Task A (%s): ", id_a);
+        cJSON *ta = cJSON_GetObjectItem(diff, "tools_a");
+        int na = cJSON_GetArraySize(ta);
+        for (int i = 0; i < na; i++) {
+            cJSON *t = cJSON_GetArrayItem(ta, i);
+            if (cJSON_IsString(t)) pos += snprintf(buf + pos, sizeof(buf) - pos, "%s%s", i ? "," : "", t->valuestring);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\nTask B (%s): ", id_b);
+        cJSON *tb = cJSON_GetObjectItem(diff, "tools_b");
+        int nb = cJSON_GetArraySize(tb);
+        for (int i = 0; i < nb; i++) {
+            cJSON *t = cJSON_GetArrayItem(tb, i);
+            if (cJSON_IsString(t)) pos += snprintf(buf + pos, sizeof(buf) - pos, "%s%s", i ? "," : "", t->valuestring);
+        }
+        cJSON_Delete(diff);
+        channels_reply(ev->chat_id, buf);
+        return;
+    }
+
     /* Unknown command */
     channels_reply(ev->chat_id,
-        "Commands: /stop /clear /status /files /tasks /decide /goal <text> /graph <cypher>");
+        "Commands: /stop /clear /status /files /tasks /decide /goal <text> /graph <cypher> "
+        "/scripts /replay <task_id> /history <n> /diff <id1> <id2>");
 }
 
 /* ========================= Message Handler ========================= */
@@ -574,7 +882,7 @@ static void handle_message(const AgentEvent *ev, const char *workspace) {
     LeaveCriticalSection(&g_state_lock);
 
     /* Chat with tools */
-    char *reply = chat_with_tools(session, workspace);
+    char *reply = chat_with_tools(session, workspace, NULL);
     if (reply) {
         channels_reply(ev->chat_id, reply);
         free(reply);
@@ -627,7 +935,7 @@ static int run_one_shot(const char *prompt, const char *stdin_data, const char *
         }
 
         int is_tool = 0;
-        char *tool_result = try_tool_call(reply, workspace, &is_tool);
+        char *tool_result = try_tool_call(reply, workspace, &is_tool, NULL);
 
         if (is_tool && tool_result) {
             fprintf(stderr, "[TOOL] %s\n", tool_result);
@@ -944,6 +1252,7 @@ static int core_init(const char *tools_dir) {
 
 static DWORD WINAPI worker_thread_func(LPVOID param) {
     time_t last_prune = 0;
+    time_t last_compact = 0;
     int save_tick = 0;
 
     while (g_running) {
@@ -955,9 +1264,7 @@ static DWORD WINAPI worker_thread_func(LPVOID param) {
         int has_task = decision_pick_task(picked_id);
         Task *t = NULL;
         if (has_task) {
-            tasks_lock();
             t = tasks_find(picked_id);
-            tasks_unlock();
         }
 
         if (t) {
@@ -979,13 +1286,22 @@ static DWORD WINAPI worker_thread_func(LPVOID param) {
             save_tick = 0;
         }
 
-        /* Prune old sessions every 60s */
+        /* Prune old sessions every 60s, compact graph every 10 min */
         time_t now = time(NULL);
         if (difftime(now, last_prune) > 60) {
             session_lock();
             session_prune(3600); /* 1 hour */
             session_unlock();
             last_prune = now;
+
+            /* Graph compaction every ~10 minutes */
+            if (difftime(now, last_compact) > 600) {
+                agent_db_lock();
+                int deleted = agent_db_compact(&g_adb, 7);
+                agent_db_unlock();
+                if (deleted > 0) printf("[COMPACT] Removed %d old nodes\n", deleted);
+                last_compact = now;
+            }
         }
 
         /* Wait for new task or timeout */
@@ -1143,8 +1459,12 @@ int main(int argc, char *argv[]) {
 
     if (!core_init(tools_dir)) return 1;
 
-    /* Check for piped stdin */
-    char *stdin_data = read_stdin_all();
+    /* Check for piped stdin — only consume if we have a one-shot prompt
+       (positional arg). For always-on mode, stdin is used interactively. */
+    char *stdin_data = NULL;
+    if (one_shot_prompt) {
+        stdin_data = read_stdin_all();
+    }
 
     /* One-shot mode: positional arg or piped stdin */
     if (one_shot_prompt || stdin_data) {

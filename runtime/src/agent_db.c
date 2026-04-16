@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 
 #ifdef _WIN32
@@ -33,7 +34,7 @@ static char *cypher_esc(const char *s) {
         char c = s[i];
         if (c == '\0') break;
         switch (c) {
-            case '\'': *p++ = '\''; *p++ = '\''; break;
+            case '\'': *p++ = '\\'; *p++ = '\''; break;
             case '\\': *p++ = '\\'; *p++ = '\\'; break;
             case '\n': *p++ = '\\'; *p++ = 'n';  break;
             case '\r': *p++ = '\\'; *p++ = 'r';  break;
@@ -56,6 +57,11 @@ static void gen_id(char *buf, size_t size, const char *prefix) {
 }
 
 /* ========================= Query Helpers ========================= */
+
+/* Thread safety guard for public agent_db functions.
+   Uses recursive CRITICAL_SECTION so nested calls are safe. */
+#define DB_GUARD(adb) EnterCriticalSection(&(adb)->_lock)
+#define DB_UNGUARD(adb) LeaveCriticalSection(&(adb)->_lock)
 
 static int db_exec(AgentDB *adb, const char *cypher) {
     ryu_query_result result;
@@ -98,11 +104,25 @@ static char *db_get_string(AgentDB *adb, const char *cypher) {
 }
 
 static int64_t db_get_int64(AgentDB *adb, const char *cypher, int64_t def) {
-    char *s = db_get_string(adb, cypher);
-    if (!s) return def;
+    ryu_query_result result;
+    ryu_state state = ryu_connection_query(&adb->_conn, cypher, &result);
+    if (state != RyuSuccess || !ryu_query_result_is_success(&result)) {
+        ryu_query_result_destroy(&result);
+        return def;
+    }
     int64_t v = def;
-    sscanf(s, "%lld", (long long *)&v);
-    ryu_destroy_string(s);
+    if (ryu_query_result_has_next(&result)) {
+        ryu_flat_tuple tuple;
+        ryu_query_result_get_next(&result, &tuple);
+        ryu_value val;
+        ryu_flat_tuple_get_value(&tuple, 0, &val);
+        if (!ryu_value_is_null(&val)) {
+            ryu_value_get_int64(&val, &v);
+        }
+        ryu_value_destroy(&val);
+        ryu_flat_tuple_destroy(&tuple);
+    }
+    ryu_query_result_destroy(&result);
     return v;
 }
 
@@ -117,7 +137,7 @@ static const char *SCHEMA_DDL[] = {
 
     "CREATE NODE TABLE MEMORY ("
     "  id STRING PRIMARY KEY, category STRING, key STRING,"
-    "  content STRING, val STRING, created_at INT64)",
+    "  content STRING, val STRING, embedding STRING, created_at INT64)",
 
     "CREATE NODE TABLE GOAL ("
     "  id STRING PRIMARY KEY, text STRING, status STRING, created_at INT64)",
@@ -217,8 +237,8 @@ void agent_db_close(AgentDB *adb) {
     ryu_value _v; \
     ryu_flat_tuple_get_value(tup, (uint64_t)(idx), &_v); \
     if (!ryu_value_is_null(&_v)) { \
-        char *_s; ryu_value_get_string(&_v, &_s); \
-        t->field = atoi(_s); ryu_destroy_string(_s); \
+        int64_t _i; ryu_value_get_int64(&_v, &_i); \
+        t->field = (int)_i; \
     } \
     ryu_value_destroy(&_v); \
 } while(0)
@@ -227,8 +247,8 @@ void agent_db_close(AgentDB *adb) {
     ryu_value _v; \
     ryu_flat_tuple_get_value(tup, (uint64_t)(idx), &_v); \
     if (!ryu_value_is_null(&_v)) { \
-        char *_s; ryu_value_get_string(&_v, &_s); \
-        t->field = strtoll(_s, NULL, 10); ryu_destroy_string(_s); \
+        int64_t _i; ryu_value_get_int64(&_v, &_i); \
+        t->field = _i; \
     } \
     ryu_value_destroy(&_v); \
 } while(0)
@@ -278,6 +298,7 @@ static char *dup_col(ryu_flat_tuple *tup, int idx) {
 char *agent_db_task_create(AgentDB *adb, const char *name,
                            const char *prompt, int priority,
                            const char *source, long long chat_id) {
+    DB_GUARD(adb);
     char id[64];
     gen_id(id, sizeof(id), "task");
 
@@ -295,11 +316,13 @@ char *agent_db_task_create(AgentDB *adb, const char *name,
         (long long)time(NULL), (long long)time(NULL));
 
     free(e_name); free(e_prompt); free(e_source);
-    if (!db_exec(adb, q)) return NULL;
+    if (!db_exec(adb, q)) { DB_UNGUARD(adb); return NULL; }
+    DB_UNGUARD(adb);
     return _strdup(id);
 }
 
 DbTask *agent_db_task_next(AgentDB *adb) {
+    DB_GUARD(adb);
     const char *q =
         "MATCH (t:TASK) WHERE t.status = 'pending' OR t.status = 'failed' "
         "RETURN t.id, t.name, t.prompt, t.status, t.result, t.source, "
@@ -311,6 +334,7 @@ DbTask *agent_db_task_next(AgentDB *adb) {
     if (ryu_connection_query(&adb->_conn, q, &result) != RyuSuccess ||
         !ryu_query_result_is_success(&result)) {
         ryu_query_result_destroy(&result);
+        DB_UNGUARD(adb);
         return NULL;
     }
 
@@ -344,6 +368,7 @@ DbTask *agent_db_task_next(AgentDB *adb) {
         } else agent_db_task_free(t);
     }
     ryu_query_result_destroy(&result);
+    DB_UNGUARD(adb);
     return best;
 }
 
@@ -351,6 +376,7 @@ int agent_db_task_update(AgentDB *adb, const char *id,
                          const char *status, const char *result,
                          const char *plan, const char *state,
                          const char *last_error) {
+    DB_GUARD(adb);
     char q[16384];
     int pos = 0;
     pos += snprintf(q + pos, sizeof(q) - pos, "MATCH (t:TASK {id:'%s'}) SET ", id);
@@ -374,10 +400,13 @@ int agent_db_task_update(AgentDB *adb, const char *id,
 
     pos += snprintf(q + pos, sizeof(q) - pos, "%st.updated_at = %lld",
                     first ? "" : ", ", (long long)time(NULL));
-    return db_exec(adb, q);
+    int _rc = db_exec(adb, q);
+    DB_UNGUARD(adb);
+    return _rc;
 }
 
 int agent_db_task_append_state(AgentDB *adb, const char *id, const char *text) {
+    DB_GUARD(adb);
     char q[512];
     snprintf(q, sizeof(q), "MATCH (t:TASK {id:'%s'}) RETURN t.state", id);
     char *cur = db_get_string(adb, q);
@@ -392,19 +421,25 @@ int agent_db_task_append_state(AgentDB *adb, const char *id, const char *text) {
     snprintf(ns, sizeof(ns), "%s%s%s", cs, cs[0] ? "\n" : "", text);
     if (cur) ryu_destroy_string(cur); else free(cs);
 
-    return agent_db_task_update(adb, id, NULL, NULL, NULL, ns, NULL);
+    int _rc = agent_db_task_update(adb, id, NULL, NULL, NULL, ns, NULL);
+    DB_UNGUARD(adb);
+    return _rc;
 }
 
 int agent_db_task_count(AgentDB *adb, const char *status) {
+    DB_GUARD(adb);
     char q[256];
     if (status)
         snprintf(q, sizeof(q), "MATCH (t:TASK {status:'%s'}) RETURN count(t)", status);
     else
         snprintf(q, sizeof(q), "MATCH (t:TASK) RETURN count(t)");
-    return (int)db_get_int64(adb, q, 0);
+    int _rc = (int)db_get_int64(adb, q, 0);
+    DB_UNGUARD(adb);
+    return _rc;
 }
 
 void agent_db_task_list(AgentDB *adb, char *buf, size_t size) {
+    DB_GUARD(adb);
     buf[0] = 0;
     const char *q =
         "MATCH (t:TASK) RETURN t.id, t.status, t.priority, t.attempts, "
@@ -415,6 +450,7 @@ void agent_db_task_list(AgentDB *adb, char *buf, size_t size) {
         !ryu_query_result_is_success(&result)) {
         ryu_query_result_destroy(&result);
         strncpy(buf, "No tasks (db error).\n", size - 1);
+        DB_UNGUARD(adb);
         return;
     }
 
@@ -437,9 +473,11 @@ void agent_db_task_list(AgentDB *adb, char *buf, size_t size) {
     }
     ryu_query_result_destroy(&result);
     if (pos == 0) strncpy(buf, "No tasks.\n", size - 1);
+    DB_UNGUARD(adb);
 }
 
 DbTask *agent_db_task_find(AgentDB *adb, const char *id) {
+    DB_GUARD(adb);
     char *e = cypher_esc(id);
     char q[512];
     snprintf(q, sizeof(q),
@@ -452,6 +490,7 @@ DbTask *agent_db_task_find(AgentDB *adb, const char *id) {
     if (ryu_connection_query(&adb->_conn, q, &result) != RyuSuccess ||
         !ryu_query_result_is_success(&result)) {
         ryu_query_result_destroy(&result);
+        DB_UNGUARD(adb);
         return NULL;
     }
     DbTask *t = NULL;
@@ -462,10 +501,12 @@ DbTask *agent_db_task_find(AgentDB *adb, const char *id) {
         ryu_flat_tuple_destroy(&tup);
     }
     ryu_query_result_destroy(&result);
+    DB_UNGUARD(adb);
     return t;
 }
 
 int agent_db_task_get_runnable(AgentDB *adb, DbTask **out, int max) {
+    DB_GUARD(adb);
     const char *q =
         "MATCH (t:TASK) WHERE t.status = 'pending' OR t.status = 'failed' "
         "RETURN t.id, t.name, t.prompt, t.status, t.result, t.source, "
@@ -477,6 +518,7 @@ int agent_db_task_get_runnable(AgentDB *adb, DbTask **out, int max) {
     if (ryu_connection_query(&adb->_conn, q, &result) != RyuSuccess ||
         !ryu_query_result_is_success(&result)) {
         ryu_query_result_destroy(&result);
+        DB_UNGUARD(adb);
         return 0;
     }
 
@@ -500,6 +542,7 @@ int agent_db_task_get_runnable(AgentDB *adb, DbTask **out, int max) {
         out[count++] = t;
     }
     ryu_query_result_destroy(&result);
+    DB_UNGUARD(adb);
     return count;
 }
 
@@ -509,23 +552,223 @@ void agent_db_task_free(DbTask *t) { free(t); }
 
 char *agent_db_memory_add(AgentDB *adb, const char *category,
                           const char *key, const char *content) {
-    char id[64]; gen_id(id, sizeof(id), "mem");
+    DB_GUARD(adb);
     char *ec = cypher_esc(category), *ek = cypher_esc(key), *en = cypher_esc(content);
+
+    /* Check for duplicate (same category + key) */
     char q[16384];
     snprintf(q, sizeof(q),
+        "MATCH (m:MEMORY {category:'%s', key:'%s'}) RETURN m.id LIMIT 1", ec, ek);
+    char *existing = db_get_string(adb, q);
+    if (existing) {
+        /* Update existing */
+        char *ret = _strdup(existing);
+        ryu_destroy_string(existing);
+        snprintf(q, sizeof(q),
+            "MATCH (m:MEMORY {category:'%s', key:'%s'}) "
+            "SET m.content = '%s', m.created_at = %lld",
+            ec, ek, en, (long long)time(NULL));
+        free(ec); free(ek); free(en);
+        db_exec(adb, q);
+        DB_UNGUARD(adb);
+        return ret;
+    }
+
+    char id[64]; gen_id(id, sizeof(id), "mem");
+    snprintf(q, sizeof(q),
         "CREATE (m:MEMORY {id:'%s', category:'%s', key:'%s', content:'%s', "
-        "val:'', created_at:%lld})", id, ec, ek, en, (long long)time(NULL));
+        "val:'', embedding:'', created_at:%lld})", id, ec, ek, en, (long long)time(NULL));
     free(ec); free(ek); free(en);
-    if (!db_exec(adb, q)) return NULL;
+    if (!db_exec(adb, q)) { DB_UNGUARD(adb); return NULL; }
+    DB_UNGUARD(adb);
     return _strdup(id);
 }
 
+int agent_db_memory_store_embedding(AgentDB *adb, const char *memory_id,
+                                     const float *vec, int dim) {
+    DB_GUARD(adb);
+    if (!vec || dim <= 0) { DB_UNGUARD(adb); return 0; }
+    /* Serialize as JSON array string: "[0.1,0.2,...]" */
+    size_t bufsz = dim * 16 + 4;
+    char *buf = (char *)malloc(bufsz);
+    if (!buf) { DB_UNGUARD(adb); return 0; }
+    int pos = 0;
+    buf[pos++] = '[';
+    for (int i = 0; i < dim; i++) {
+        if (i > 0) buf[pos++] = ',';
+        pos += snprintf(buf + pos, bufsz - pos, "%.6f", vec[i]);
+    }
+    buf[pos++] = ']';
+    buf[pos] = 0;
+
+    char *e_id = cypher_esc(memory_id), *e_emb = cypher_esc(buf);
+    char q[65536];
+    snprintf(q, sizeof(q),
+        "MATCH (m:MEMORY {id:'%s'}) SET m.embedding = '%s'", e_id, e_emb);
+    free(e_id); free(e_emb); free(buf);
+    int _rc = db_exec(adb, q);
+    DB_UNGUARD(adb);
+    return _rc;
+}
+
+int agent_db_memory_get_embedding(AgentDB *adb, const char *memory_id,
+                                   float **out_vec, int *out_dim) {
+    DB_GUARD(adb);
+    *out_vec = NULL; *out_dim = 0;
+    char *e = cypher_esc(memory_id);
+    char q[512];
+    snprintf(q, sizeof(q),
+        "MATCH (m:MEMORY {id:'%s'}) RETURN m.embedding", e);
+    free(e);
+    char *s = db_get_string(adb, q);
+    if (!s) { DB_UNGUARD(adb); return 0; }
+    char *emb_str = _strdup(s);
+    ryu_destroy_string(s);
+    if (!emb_str || emb_str[0] == 0) { free(emb_str); DB_UNGUARD(adb); return 0; }
+
+    /* Parse JSON array */
+    cJSON *arr = cJSON_Parse(emb_str);
+    free(emb_str);
+    if (!cJSON_IsArray(arr)) { if (arr) cJSON_Delete(arr); DB_UNGUARD(adb); return 0; }
+    int dim = cJSON_GetArraySize(arr);
+    if (dim <= 0) { cJSON_Delete(arr); DB_UNGUARD(adb); return 0; }
+    float *vec = (float *)malloc(dim * sizeof(float));
+    if (!vec) { cJSON_Delete(arr); DB_UNGUARD(adb); return 0; }
+    for (int i = 0; i < dim; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, i);
+        vec[i] = (float)(cJSON_IsNumber(item) ? item->valuedouble : 0.0f);
+    }
+    cJSON_Delete(arr);
+    *out_vec = vec;
+    *out_dim = dim;
+    DB_UNGUARD(adb);
+    return 1;
+}
+
 cJSON *agent_db_memory_search(AgentDB *adb, const float *vec, int dim, int k) {
-    (void)adb;(void)vec;(void)dim;(void)k;
-    return cJSON_CreateArray();
+    DB_GUARD(adb);
+    cJSON *arr = cJSON_CreateArray();
+    if (k <= 0) k = 5;
+
+    if (vec && dim > 0) {
+        /* Vector path: fetch all MEMORY with non-empty embedding, compute cosine sim */
+        const char *q = "MATCH (m:MEMORY) WHERE m.embedding <> '' AND m.embedding IS NOT NULL "
+                        "RETURN m.id, m.category, m.key, m.content, m.embedding";
+        ryu_query_result result;
+        if (ryu_connection_query(&adb->_conn, q, &result) != RyuSuccess ||
+            !ryu_query_result_is_success(&result)) {
+            ryu_query_result_destroy(&result);
+            DB_UNGUARD(adb);
+            return arr;
+        }
+
+        /* Collect candidates */
+        typedef struct { char id[64]; char cat[64]; char key[256]; char content[1024]; double score; } CandEntry;
+        CandEntry *cands = NULL;
+        int ncands = 0, cap = 64;
+        cands = (CandEntry *)malloc(cap * sizeof(CandEntry));
+
+        while (ryu_query_result_has_next(&result)) {
+            ryu_flat_tuple tup;
+            ryu_query_result_get_next(&result, &tup);
+            char *mid = dup_col(&tup, 0);
+            char *mcat = dup_col(&tup, 1);
+            char *mkey = dup_col(&tup, 2);
+            char *mcont = dup_col(&tup, 3);
+            char *memb = dup_col(&tup, 4);
+
+            if (mid && memb && memb[0]) {
+                cJSON *earr = cJSON_Parse(memb);
+                if (cJSON_IsArray(earr)) {
+                    int edim = cJSON_GetArraySize(earr);
+                    if (edim == dim) {
+                        double dot = 0, na = 0, nb = 0;
+                        for (int i = 0; i < dim; i++) {
+                            cJSON *item = cJSON_GetArrayItem(earr, i);
+                            float b = (float)(cJSON_IsNumber(item) ? item->valuedouble : 0.0);
+                            dot += (double)vec[i] * b;
+                            na += (double)vec[i] * vec[i];
+                            nb += (double)b * b;
+                        }
+                        double denom = sqrt(na) * sqrt(nb);
+                        double score = (denom > 0) ? dot / denom : 0;
+
+                        if (ncands >= cap) {
+                            cap *= 2;
+                            cands = (CandEntry *)realloc(cands, cap * sizeof(CandEntry));
+                        }
+                        CandEntry *c = &cands[ncands++];
+                        strncpy(c->id, mid, 63); c->id[63] = 0;
+                        strncpy(c->cat, mcat ? mcat : "", 63);
+                        strncpy(c->key, mkey ? mkey : "", 255);
+                        if (mcont) { strncpy(c->content, mcont, 1023); c->content[1023] = 0; }
+                        else c->content[0] = 0;
+                        c->score = score;
+                    }
+                    cJSON_Delete(earr);
+                }
+            }
+            free(mid); free(mcat); free(mkey); free(mcont); free(memb);
+            ryu_flat_tuple_destroy(&tup);
+        }
+        ryu_query_result_destroy(&result);
+
+        /* Sort by score descending */
+        for (int i = 0; i < ncands - 1; i++) {
+            int best = i;
+            for (int j = i + 1; j < ncands; j++) {
+                if (cands[j].score > cands[best].score) best = j;
+            }
+            if (best != i) { CandEntry tmp = cands[i]; cands[i] = cands[best]; cands[best] = tmp; }
+        }
+
+        int nk = (ncands < k) ? ncands : k;
+        for (int i = 0; i < nk; i++) {
+            cJSON *item = cJSON_CreateObject();
+            cJSON_AddStringToObject(item, "id", cands[i].id);
+            cJSON_AddStringToObject(item, "category", cands[i].cat);
+            cJSON_AddStringToObject(item, "key", cands[i].key);
+            cJSON_AddStringToObject(item, "content", cands[i].content);
+            cJSON_AddNumberToObject(item, "score", cands[i].score);
+            cJSON_AddItemToArray(arr, item);
+        }
+        free(cands);
+    } else {
+        /* Text fallback */
+        const char *q = "MATCH (m:MEMORY) WHERE m.category <> 'scalar' "
+                        "RETURN m.id, m.category, m.key, m.content LIMIT 20";
+        ryu_query_result result;
+        if (ryu_connection_query(&adb->_conn, q, &result) != RyuSuccess ||
+            !ryu_query_result_is_success(&result)) {
+            ryu_query_result_destroy(&result);
+            DB_UNGUARD(adb);
+            return arr;
+        }
+        int count = 0;
+        while (ryu_query_result_has_next(&result) && count < k) {
+            ryu_flat_tuple tup;
+            ryu_query_result_get_next(&result, &tup);
+            char *mid = dup_col(&tup, 0), *mcat = dup_col(&tup, 1);
+            char *mkey = dup_col(&tup, 2), *mcont = dup_col(&tup, 3);
+            cJSON *item = cJSON_CreateObject();
+            cJSON_AddStringToObject(item, "id", mid ? mid : "");
+            cJSON_AddStringToObject(item, "category", mcat ? mcat : "");
+            cJSON_AddStringToObject(item, "key", mkey ? mkey : "");
+            cJSON_AddStringToObject(item, "content", mcont ? mcont : "");
+            cJSON_AddNumberToObject(item, "score", 0.0);
+            cJSON_AddItemToArray(arr, item);
+            free(mid); free(mcat); free(mkey); free(mcont);
+            ryu_flat_tuple_destroy(&tup);
+            count++;
+        }
+        ryu_query_result_destroy(&result);
+    }
+    DB_UNGUARD(adb);
+    return arr;
 }
 
 void agent_db_memory_set_scalar(AgentDB *adb, const char *key, const char *val) {
+    DB_GUARD(adb);
     char *ek = cypher_esc(key), *ev = cypher_esc(val);
     char q[16384];
     snprintf(q, sizeof(q),
@@ -535,13 +778,15 @@ void agent_db_memory_set_scalar(AgentDB *adb, const char *key, const char *val) 
     char id[64]; gen_id(id, sizeof(id), "sc");
     snprintf(q, sizeof(q),
         "CREATE (m:MEMORY {id:'%s', category:'scalar', key:'%s', "
-        "content:'', val:'%s', created_at:%lld})",
+        "content:'', val:'%s', embedding:'', created_at:%lld})",
         id, ek, ev, (long long)time(NULL));
     free(ek); free(ev);
     db_exec(adb, q);
+    DB_UNGUARD(adb);
 }
 
 char *agent_db_memory_get_scalar(AgentDB *adb, const char *key) {
+    DB_GUARD(adb);
     char *ek = cypher_esc(key);
     char q[2048];
     snprintf(q, sizeof(q),
@@ -549,18 +794,21 @@ char *agent_db_memory_get_scalar(AgentDB *adb, const char *key) {
     free(ek);
     /* db_get_string returns ryu-allocated string, convert to malloc */
     char *s = db_get_string(adb, q);
-    if (!s) return NULL;
+    if (!s) { DB_UNGUARD(adb); return NULL; }
     char *ret = _strdup(s);
     ryu_destroy_string(s);
+    DB_UNGUARD(adb);
     return ret;
 }
 
 void agent_db_memory_increment(AgentDB *adb, const char *key) {
+    DB_GUARD(adb);
     char *cur = agent_db_memory_get_scalar(adb, key);
     long long val = 0;
     if (cur) { val = strtoll(cur, NULL, 10); free(cur); }
     char buf[32]; snprintf(buf, sizeof(buf), "%lld", val + 1);
     agent_db_memory_set_scalar(adb, key, buf);
+    DB_UNGUARD(adb);
 }
 
 int agent_db_memory_step_count(AgentDB *adb) {
@@ -573,6 +821,7 @@ int agent_db_memory_step_count(AgentDB *adb) {
 /* ========================= Goals ========================= */
 
 int agent_db_goal_create(AgentDB *adb, const char *text) {
+    DB_GUARD(adb);
     char id[64]; gen_id(id, sizeof(id), "goal");
     char *e = cypher_esc(text);
     char q[4096];
@@ -580,13 +829,16 @@ int agent_db_goal_create(AgentDB *adb, const char *text) {
         "CREATE (g:GOAL {id:'%s', text:'%s', status:'active', created_at:%lld})",
         id, e, (long long)time(NULL));
     free(e);
-    return db_exec(adb, q);
+    int _rc = db_exec(adb, q);
+    DB_UNGUARD(adb);
+    return _rc;
 }
 
 /* ========================= Sessions & Messages ========================= */
 
 char *agent_db_session_get_or_create(AgentDB *adb, const char *chat_id,
                                      const char *channel) {
+    DB_GUARD(adb);
     char *ec = cypher_esc(chat_id);
     char q[512];
     snprintf(q, sizeof(q),
@@ -603,6 +855,7 @@ char *agent_db_session_get_or_create(AgentDB *adb, const char *chat_id,
             "MATCH (s:SESSION {id:'%s'}) SET s.last_active = %lld",
             ret, (long long)time(NULL));
         db_exec(adb, uq);
+        DB_UNGUARD(adb);
         return ret;
     }
 
@@ -613,12 +866,14 @@ char *agent_db_session_get_or_create(AgentDB *adb, const char *chat_id,
         "CREATE (s:SESSION {id:'%s', chat_id:%s, channel:'%s', last_active:%lld})",
         id, ec, ech, (long long)time(NULL));
     free(ec); free(ech);
-    if (!db_exec(adb, q)) return NULL;
+    if (!db_exec(adb, q)) { DB_UNGUARD(adb); return NULL; }
+    DB_UNGUARD(adb);
     return _strdup(id);
 }
 
 char *agent_db_message_append(AgentDB *adb, const char *session_id,
                                const char *role, const char *content, int seq) {
+    DB_GUARD(adb);
     char id[64]; gen_id(id, sizeof(id), "msg");
     char *es = cypher_esc(session_id), *er = cypher_esc(role);
     char *ec = cypher_esc(content);
@@ -629,11 +884,13 @@ char *agent_db_message_append(AgentDB *adb, const char *session_id,
         "content:'%s', seq:%d, created_at:%lld})",
         id, es, er, ec, seq, (long long)time(NULL));
     free(es); free(er); free(ec);
-    if (!db_exec(adb, q)) return NULL;
+    if (!db_exec(adb, q)) { DB_UNGUARD(adb); return NULL; }
+    DB_UNGUARD(adb);
     return _strdup(id);
 }
 
 cJSON *agent_db_session_history(AgentDB *adb, const char *session_id) {
+    DB_GUARD(adb);
     char *es = cypher_esc(session_id);
     char q[512];
     snprintf(q, sizeof(q),
@@ -646,6 +903,7 @@ cJSON *agent_db_session_history(AgentDB *adb, const char *session_id) {
     if (ryu_connection_query(&adb->_conn, q, &result) != RyuSuccess ||
         !ryu_query_result_is_success(&result)) {
         ryu_query_result_destroy(&result);
+        DB_UNGUARD(adb);
         return arr;
     }
 
@@ -664,25 +922,32 @@ cJSON *agent_db_session_history(AgentDB *adb, const char *session_id) {
         ryu_flat_tuple_destroy(&tup);
     }
     ryu_query_result_destroy(&result);
+    DB_UNGUARD(adb);
     return arr;
 }
 
 int agent_db_session_clear(AgentDB *adb, const char *session_id) {
+    DB_GUARD(adb);
     char *e = cypher_esc(session_id);
     char q[512];
     snprintf(q, sizeof(q), "MATCH (m:MESSAGE {session_id:'%s'}) DELETE m", e);
     free(e);
-    return db_exec(adb, q);
+    int _rc = db_exec(adb, q);
+    DB_UNGUARD(adb);
+    return _rc;
 }
 
 int agent_db_session_prune(AgentDB *adb, int64_t ttl_seconds) {
+    DB_GUARD(adb);
     int64_t cutoff = (int64_t)time(NULL) - ttl_seconds;
     char q[256];
     snprintf(q, sizeof(q),
         "MATCH (s:SESSION) WHERE s.last_active < %lld "
         "WITH s MATCH (m:MESSAGE {session_id:s.id}) DELETE m "
         "WITH s DELETE s RETURN count(s)", (long long)cutoff);
-    return (int)db_get_int64(adb, q, 0);
+    int _rc = (int)db_get_int64(adb, q, 0);
+    DB_UNGUARD(adb);
+    return _rc;
 }
 
 /* ========================= Tool Calls ========================= */
@@ -690,23 +955,35 @@ int agent_db_session_prune(AgentDB *adb, int64_t ttl_seconds) {
 char *agent_db_tool_call_record(AgentDB *adb, const char *task_id,
                                  const char *tool, const char *args_json,
                                  const char *result_json, int64_t dur_ms) {
+    DB_GUARD(adb);
     char id[64]; gen_id(id, sizeof(id), "tc");
-    char *et = cypher_esc(tool), *ea = cypher_esc(args_json ? args_json : "");
-    char *er = cypher_esc(result_json ? result_json : ""), *ei = cypher_esc(task_id);
+    char *et = cypher_esc(tool), *ei = cypher_esc(task_id);
 
-    char q[32768];
+    /* Truncate and sanitize args/result: replace { } with ( ) to avoid
+       Cypher parser treating JSON braces as property-map delimiters */
+    char sa[2048] = "", sr[2048] = "";
+    if (args_json) { strncpy(sa, args_json, sizeof(sa)-1); sa[sizeof(sa)-1] = 0; }
+    if (result_json) { strncpy(sr, result_json, sizeof(sr)-1); sr[sizeof(sr)-1] = 0; }
+    for (char *p = sa; *p; p++) { if (*p == '{') *p = '('; if (*p == '}') *p = ')'; }
+    for (char *p = sr; *p; p++) { if (*p == '{') *p = '('; if (*p == '}') *p = ')'; }
+    char *ta = cypher_esc(sa), *tr = cypher_esc(sr);
+
+    char q[16384];
     snprintf(q, sizeof(q),
         "CREATE (tc:TOOL_CALL {id:'%s', tool:'%s', args_json:'%s', "
         "result_json:'%s', duration_ms:%lld, created_at:%lld})",
-        id, et, ea, er, (long long)dur_ms, (long long)time(NULL));
-    free(et); free(ea); free(er);
-    if (!db_exec(adb, q)) { free(ei); return NULL; }
+        id, et, ta, tr, (long long)dur_ms, (long long)time(NULL));
+    free(ta); free(tr); free(et);
+    if (!db_exec(adb, q)) {
+        free(ei); DB_UNGUARD(adb); return NULL;
+    }
 
     snprintf(q, sizeof(q),
         "MATCH (t:TASK {id:'%s'}), (tc:TOOL_CALL {id:'%s'}) CREATE (t)-[:CALLED]->(tc)",
         ei, id);
     free(ei);
     db_exec(adb, q);
+    DB_UNGUARD(adb);
     return _strdup(id);
 }
 
@@ -714,6 +991,7 @@ char *agent_db_tool_call_record(AgentDB *adb, const char *task_id,
 
 int agent_db_file_wrote(AgentDB *adb, const char *task_id,
                         const char *path, const char *hash, int64_t size) {
+    DB_GUARD(adb);
     char *ep = cypher_esc(path), *eh = cypher_esc(hash), *et = cypher_esc(task_id);
     char q[4096];
     snprintf(q, sizeof(q),
@@ -724,29 +1002,35 @@ int agent_db_file_wrote(AgentDB *adb, const char *task_id,
         "MATCH (t:TASK {id:'%s'}), (f:FILE {path:'%s'}) CREATE (t)-[:USED]->(f)",
         et, ep);
     free(ep); free(eh); free(et);
-    return db_exec(adb, q);
+    int _rc = db_exec(adb, q);
+    DB_UNGUARD(adb);
+    return _rc;
 }
 
 int agent_db_file_read(AgentDB *adb, const char *task_id, const char *path) {
+    DB_GUARD(adb);
     char *et = cypher_esc(task_id), *ep = cypher_esc(path);
     char q[4096];
     snprintf(q, sizeof(q),
         "MATCH (t:TASK {id:'%s'}), (f:FILE {path:'%s'}) CREATE (t)-[:USED]->(f)",
         et, ep);
     free(et); free(ep);
-    return db_exec(adb, q);
+    int _rc = db_exec(adb, q);
+    DB_UNGUARD(adb);
+    return _rc;
 }
 
 /* ========================= Prompt Cache ========================= */
 
 char *agent_db_cache_get(AgentDB *adb, const char *hash) {
+    DB_GUARD(adb);
     char *e = cypher_esc(hash);
     char q[512];
     snprintf(q, sizeof(q),
         "MATCH (c:PROMPT_CACHE {hash:'%s'}) RETURN c.response", e);
     free(e);
     char *s = db_get_string(adb, q);
-    if (!s) return NULL;
+    if (!s) { DB_UNGUARD(adb); return NULL; }
     char *ret = _strdup(s);
     ryu_destroy_string(s);
 
@@ -755,11 +1039,13 @@ char *agent_db_cache_get(AgentDB *adb, const char *hash) {
         "MATCH (c:PROMPT_CACHE {hash:'%s'}) SET c.hit_count = c.hit_count + 1", e);
     free(e);
     db_exec(adb, q);
+    DB_UNGUARD(adb);
     return ret;
 }
 
 int agent_db_cache_set(AgentDB *adb, const char *task_id,
                        const char *hash, const char *response) {
+    DB_GUARD(adb);
     char *eh = cypher_esc(hash), *er = cypher_esc(response), *et = cypher_esc(task_id);
     char q[65536];
     snprintf(q, sizeof(q),
@@ -767,32 +1053,126 @@ int agent_db_cache_set(AgentDB *adb, const char *task_id,
         "hit_count:0, task_id:'%s', created_at:%lld})",
         eh, er, et, (long long)time(NULL));
     free(eh); free(er); free(et);
-    return db_exec(adb, q);
+    int _rc = db_exec(adb, q);
+    DB_UNGUARD(adb);
+    return _rc;
 }
 
 /* ========================= Scripts ========================= */
 
 char *agent_db_script_store(AgentDB *adb, const char *name,
                              const char *desc, const char *tool_seq) {
+    DB_GUARD(adb);
     char *en = cypher_esc(name), *ed = cypher_esc(desc), *es = cypher_esc(tool_seq);
     char q[16384];
     snprintf(q, sizeof(q),
         "CREATE (s:SCRIPT {name:'%s', description:'%s', tool_sequence:'%s', "
         "success_count:0, created_at:%lld})", en, ed, es, (long long)time(NULL));
     free(en); free(ed); free(es);
-    if (!db_exec(adb, q)) return NULL;
+    if (!db_exec(adb, q)) { DB_UNGUARD(adb); return NULL; }
+    DB_UNGUARD(adb);
     return _strdup(name);
 }
 
-cJSON *agent_db_script_match(AgentDB *adb, const float *vec, int dim) {
-    (void)adb;(void)vec;(void)dim;
-    return cJSON_CreateArray();
+cJSON *agent_db_script_match(AgentDB *adb, const char *query) {
+    DB_GUARD(adb);
+    cJSON *arr = cJSON_CreateArray();
+    if (!query || !query[0]) { DB_UNGUARD(adb); return arr; }
+
+    char *eq = cypher_esc(query);
+    char q[4096];
+    snprintf(q, sizeof(q),
+        "MATCH (s:SCRIPT) WHERE s.tool_sequence CONTAINS '%s' OR s.description CONTAINS '%s' "
+        "RETURN s.name, s.tool_sequence, s.description, s.success_count "
+        "ORDER BY s.success_count DESC LIMIT 5", eq, eq);
+    free(eq);
+
+    ryu_query_result result;
+    if (ryu_connection_query(&adb->_conn, q, &result) != RyuSuccess ||
+        !ryu_query_result_is_success(&result)) {
+        ryu_query_result_destroy(&result);
+        DB_UNGUARD(adb);
+        return arr;
+    }
+    while (ryu_query_result_has_next(&result)) {
+        ryu_flat_tuple tup;
+        ryu_query_result_get_next(&result, &tup);
+        char *name = dup_col(&tup, 0);
+        char *seq = dup_col(&tup, 1);
+        char *desc = dup_col(&tup, 2);
+        char *sc = dup_col(&tup, 3);
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "name", name ? name : "");
+        cJSON_AddStringToObject(item, "tool_sequence", seq ? seq : "");
+        cJSON_AddStringToObject(item, "description", desc ? desc : "");
+        cJSON_AddNumberToObject(item, "success_count", sc ? atoi(sc) : 0);
+        cJSON_AddItemToArray(arr, item);
+        free(name); free(seq); free(desc); free(sc);
+        ryu_flat_tuple_destroy(&tup);
+    }
+    ryu_query_result_destroy(&result);
+    DB_UNGUARD(adb);
+    return arr;
+}
+
+char *agent_db_task_extract_script(AgentDB *adb, const char *task_id) {
+    DB_GUARD(adb);
+    char *ei = cypher_esc(task_id);
+    char q[1024];
+    snprintf(q, sizeof(q),
+        "MATCH (t:TASK {id:'%s'})-[:CALLED]->(tc:TOOL_CALL) "
+        "RETURN tc.tool ORDER BY tc.created_at", ei);
+    free(ei);
+
+    /* Collect tool sequence */
+    char seq[2048]; seq[0] = 0;
+    int pos = 0;
+    ryu_query_result result;
+    if (ryu_connection_query(&adb->_conn, q, &result) != RyuSuccess ||
+        !ryu_query_result_is_success(&result)) {
+        ryu_query_result_destroy(&result);
+        DB_UNGUARD(adb);
+        return NULL;
+    }
+    int count = 0;
+    while (ryu_query_result_has_next(&result)) {
+        ryu_flat_tuple tup;
+        ryu_query_result_get_next(&result, &tup);
+        char *tool = dup_col(&tup, 0);
+        if (tool) {
+            if (count > 0) pos += snprintf(seq + pos, sizeof(seq) - pos, ",");
+            pos += snprintf(seq + pos, sizeof(seq) - pos, "%s", tool);
+            count++;
+        }
+        free(tool);
+        ryu_flat_tuple_destroy(&tup);
+    }
+    ryu_query_result_destroy(&result);
+
+    if (count == 0) { DB_UNGUARD(adb); return NULL; }
+
+    /* Get task prompt for description */
+    snprintf(q, sizeof(q), "MATCH (t:TASK {id:'%s'}) RETURN t.prompt", task_id);
+    char *prompt = db_get_string(adb, q);
+    char desc[256] = "";
+    if (prompt) {
+        strncpy(desc, prompt, 200); desc[200] = 0;
+        ryu_destroy_string(prompt);
+    }
+
+    char script_name[128];
+    snprintf(script_name, sizeof(script_name), "workflow_%s", task_id);
+    char *ret = agent_db_script_store(adb, script_name, desc, seq);
+    DB_UNGUARD(adb);
+    return ret;
 }
 
 /* ========================= Logging ========================= */
 
 void agent_db_log_event(AgentDB *adb, const char *type, int iter,
-                        const char *stage, const char *json, int success) {
+                        const char *stage, const char *json, int success,
+                        const char *task_id) {
+    DB_GUARD(adb);
     char id[64]; gen_id(id, sizeof(id), "log");
     char *et = cypher_esc(type), *es = cypher_esc(stage), *ej = cypher_esc(json ? json : "");
     char q[32768];
@@ -802,11 +1182,23 @@ void agent_db_log_event(AgentDB *adb, const char *type, int iter,
         id, et, iter, es, ej, success ? "true" : "false", (long long)time(NULL));
     free(et); free(es); free(ej);
     db_exec(adb, q);
+
+    /* Create RECORDED_IN relationship if task_id provided */
+    if (task_id && task_id[0]) {
+        char *ei = cypher_esc(task_id);
+        snprintf(q, sizeof(q),
+            "MATCH (e:LOG_EVENT {id:'%s'}), (t:TASK {id:'%s'}) "
+            "CREATE (e)-[:RECORDED_IN]->(t)", id, ei);
+        free(ei);
+        db_exec(adb, q);
+    }
+    DB_UNGUARD(adb);
 }
 
 /* ========================= Analytics ========================= */
 
 cJSON *agent_db_tasks_failed_ranked(AgentDB *adb) {
+    DB_GUARD(adb);
     const char *q = "MATCH (t:TASK {status:'failed'}) "
         "RETURN t.id, t.prompt, t.attempts, t.last_error "
         "ORDER BY t.attempts DESC LIMIT 20";
@@ -814,7 +1206,7 @@ cJSON *agent_db_tasks_failed_ranked(AgentDB *adb) {
     ryu_query_result result;
     if (ryu_connection_query(&adb->_conn, q, &result) != RyuSuccess ||
         !ryu_query_result_is_success(&result)) {
-        ryu_query_result_destroy(&result); return arr;
+        ryu_query_result_destroy(&result); DB_UNGUARD(adb); return arr;
     }
     while (ryu_query_result_has_next(&result)) {
         ryu_flat_tuple tup;
@@ -831,12 +1223,30 @@ cJSON *agent_db_tasks_failed_ranked(AgentDB *adb) {
         ryu_flat_tuple_destroy(&tup);
     }
     ryu_query_result_destroy(&result);
+    DB_UNGUARD(adb);
     return arr;
 }
 
-cJSON *agent_db_tools_unused(AgentDB *adb) { (void)adb; return cJSON_CreateArray(); }
+cJSON *agent_db_tools_unused(AgentDB *adb, const char **known_tools, int count) {
+    DB_GUARD(adb);
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < count; i++) {
+        char *e = cypher_esc(known_tools[i]);
+        char q[512];
+        snprintf(q, sizeof(q),
+            "MATCH (tc:TOOL_CALL {tool:'%s'}) RETURN count(tc)", e);
+        free(e);
+        int64_t c = db_get_int64(adb, q, 0);
+        if (c == 0) {
+            cJSON_AddItemToArray(arr, cJSON_CreateString(known_tools[i]));
+        }
+    }
+    DB_UNGUARD(adb);
+    return arr;
+}
 
 cJSON *agent_db_file_workflow(AgentDB *adb, const char *path) {
+    DB_GUARD(adb);
     char *e = cypher_esc(path);
     char q[512];
     snprintf(q, sizeof(q),
@@ -847,7 +1257,7 @@ cJSON *agent_db_file_workflow(AgentDB *adb, const char *path) {
     ryu_query_result result;
     if (ryu_connection_query(&adb->_conn, q, &result) != RyuSuccess ||
         !ryu_query_result_is_success(&result)) {
-        ryu_query_result_destroy(&result); return arr;
+        ryu_query_result_destroy(&result); DB_UNGUARD(adb); return arr;
     }
     while (ryu_query_result_has_next(&result)) {
         ryu_flat_tuple tup;
@@ -861,16 +1271,105 @@ cJSON *agent_db_file_workflow(AgentDB *adb, const char *path) {
         ryu_flat_tuple_destroy(&tup);
     }
     ryu_query_result_destroy(&result);
+    DB_UNGUARD(adb);
     return arr;
+}
+
+int agent_db_compact(AgentDB *adb, int max_age_days) {
+    DB_GUARD(adb);
+    int64_t cutoff = (int64_t)time(NULL) - (int64_t)max_age_days * 86400;
+    int deleted = 0;
+
+    /* Delete old LOG_EVENT nodes */
+    char q[512];
+    snprintf(q, sizeof(q),
+        "MATCH (e:LOG_EVENT) WHERE e.created_at < %lld DELETE e RETURN count(e)",
+        (long long)cutoff);
+    deleted += (int)db_get_int64(adb, q, 0);
+
+    /* Delete unused PROMPT_CACHE (hit_count=0, old) */
+    snprintf(q, sizeof(q),
+        "MATCH (c:PROMPT_CACHE) WHERE c.hit_count = 0 AND c.created_at < %lld "
+        "DELETE c RETURN count(c)", (long long)cutoff);
+    deleted += (int)db_get_int64(adb, q, 0);
+
+    /* Delete orphaned TOOL_CALL nodes (no CALLED rel) */
+    db_exec(adb,
+        "MATCH (tc:TOOL_CALL) WHERE NOT EXISTS { MATCH (t:TASK)-[:CALLED]->(tc) } "
+        "DELETE tc");
+
+    DB_UNGUARD(adb);
+    return deleted;
+}
+
+cJSON *agent_db_task_diff(AgentDB *adb, const char *id_a, const char *id_b) {
+    DB_GUARD(adb);
+    cJSON *result_obj = cJSON_CreateObject();
+
+    /* Get tool sequences for both tasks */
+    char *ea = cypher_esc(id_a), *eb = cypher_esc(id_b);
+    char q[1024];
+
+    /* Task A tools */
+    snprintf(q, sizeof(q),
+        "MATCH (t:TASK {id:'%s'})-[:CALLED]->(tc:TOOL_CALL) "
+        "RETURN DISTINCT tc.tool", ea);
+    cJSON *tools_a = cJSON_CreateArray();
+    {
+        ryu_query_result result;
+        if (ryu_connection_query(&adb->_conn, q, &result) == RyuSuccess &&
+            ryu_query_result_is_success(&result)) {
+            while (ryu_query_result_has_next(&result)) {
+                ryu_flat_tuple tup;
+                ryu_query_result_get_next(&result, &tup);
+                char *t = dup_col(&tup, 0);
+                if (t) { cJSON_AddItemToArray(tools_a, cJSON_CreateString(t)); free(t); }
+                ryu_flat_tuple_destroy(&tup);
+            }
+            ryu_query_result_destroy(&result);
+        }
+    }
+
+    /* Task B tools */
+    snprintf(q, sizeof(q),
+        "MATCH (t:TASK {id:'%s'})-[:CALLED]->(tc:TOOL_CALL) "
+        "RETURN DISTINCT tc.tool", eb);
+    free(ea); free(eb);
+    cJSON *tools_b = cJSON_CreateArray();
+    {
+        ryu_query_result result;
+        if (ryu_connection_query(&adb->_conn, q, &result) == RyuSuccess &&
+            ryu_query_result_is_success(&result)) {
+            while (ryu_query_result_has_next(&result)) {
+                ryu_flat_tuple tup;
+                ryu_query_result_get_next(&result, &tup);
+                char *t = dup_col(&tup, 0);
+                if (t) { cJSON_AddItemToArray(tools_b, cJSON_CreateString(t)); free(t); }
+                ryu_flat_tuple_destroy(&tup);
+            }
+            ryu_query_result_destroy(&result);
+        }
+    }
+
+    cJSON_AddItemToObject(result_obj, "tools_a", tools_a);
+    cJSON_AddItemToObject(result_obj, "tools_b", tools_b);
+    DB_UNGUARD(adb);
+    return result_obj;
 }
 
 /* ========================= Graph Stats ========================= */
 
 int64_t agent_db_node_count(AgentDB *adb) {
-    return db_get_int64(adb, "MATCH (n) RETURN count(n)", 0);
+    DB_GUARD(adb);
+    int64_t _rc = db_get_int64(adb, "MATCH (n) RETURN count(n)", 0);
+    DB_UNGUARD(adb);
+    return _rc;
 }
 int64_t agent_db_rel_count(AgentDB *adb) {
-    return db_get_int64(adb, "MATCH ()-[r]->() RETURN count(r)", 0);
+    DB_GUARD(adb);
+    int64_t _rc = db_get_int64(adb, "MATCH ()-[r]->() RETURN count(r)", 0);
+    DB_UNGUARD(adb);
+    return _rc;
 }
 
 /* ========================= Migration ========================= */

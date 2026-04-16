@@ -20,6 +20,7 @@
 extern AgentDB g_adb;
 
 static char g_endpoint[256];
+static char g_embed_endpoint[256];
 static char g_model[64];
 static char g_apikey[256];
 static int  g_timeout_ms = 30000;
@@ -135,6 +136,15 @@ void llm_init(const char *endpoint, const char *model, const char *apikey, int t
     strncpy(g_apikey, apikey, sizeof(g_apikey) - 1);
     g_apikey[sizeof(g_apikey) - 1] = 0;
     g_timeout_ms = timeout_ms;
+
+    /* Derive embeddings endpoint from chat endpoint */
+    g_embed_endpoint[0] = 0;
+    const char *cc = strstr(g_endpoint, "/chat/completions");
+    if (cc) {
+        size_t prefix_len = cc - g_endpoint;
+        memcpy(g_embed_endpoint, g_endpoint, prefix_len);
+        strcpy(g_embed_endpoint + prefix_len, "/embeddings");
+    }
 }
 
 /* ========================= HTTP ========================= */
@@ -544,4 +554,53 @@ char *llm_extract_json(const char *response) {
     }
 
     return NULL;
+}
+
+/* ========================= Embeddings ========================= */
+
+float *llm_embed(const char *text, int *out_dim) {
+    if (out_dim) *out_dim = 0;
+    if (!g_embed_endpoint[0]) return NULL;
+    if (!text || !text[0]) return NULL;
+
+    char *escaped = llm_escape_json_string(text);
+    if (!escaped) return NULL;
+
+    size_t payload_size = strlen(escaped) + 256;
+    char *payload = (char *)malloc(payload_size);
+    if (!payload) { free(escaped); return NULL; }
+
+    snprintf(payload, payload_size,
+        "{\"model\":\"%s\",\"input\":\"%s\"}", g_model, escaped);
+    free(escaped);
+
+    char *resp = http_post(g_embed_endpoint, payload);
+    free(payload);
+    if (!resp) return NULL;
+
+    cJSON *root = cJSON_Parse(resp);
+    free(resp);
+    if (!root) return NULL;
+
+    /* Parse: { "data": [{ "embedding": [0.1, 0.2, ...] }] } */
+    cJSON *data = cJSON_GetObjectItem(root, "data");
+    cJSON *first = cJSON_GetArrayItem(data, 0);
+    cJSON *emb = first ? cJSON_GetObjectItem(first, "embedding") : NULL;
+    if (!cJSON_IsArray(emb)) {
+        cJSON_Delete(root);
+        return NULL;
+    }
+
+    int dim = cJSON_GetArraySize(emb);
+    float *vec = (float *)malloc(dim * sizeof(float));
+    if (!vec) { cJSON_Delete(root); return NULL; }
+
+    for (int i = 0; i < dim; i++) {
+        cJSON *item = cJSON_GetArrayItem(emb, i);
+        vec[i] = (float)(cJSON_IsNumber(item) ? item->valuedouble : 0.0);
+    }
+
+    cJSON_Delete(root);
+    if (out_dim) *out_dim = dim;
+    return vec;
 }

@@ -32,3 +32,7 @@ void llm_hash_to_hex(unsigned long long hash, char *out, size_t out_size);
 
 /* Query last cache hit status (call right after llm_chat) */
 int llm_last_cache_hit(void);
+
+/* Generate embedding for text. Returns malloc'd float array and sets *out_dim.
+   Returns NULL on failure (endpoint unavailable, parse error, etc). */
+float *llm_embed(const char *text, int *out_dim);

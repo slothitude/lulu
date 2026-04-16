@@ -90,6 +90,12 @@ char  *agent_db_memory_add(AgentDB *adb, const char *category,
                            const char *key, const char *content);
 cJSON *agent_db_memory_search(AgentDB *adb, const float *vec, int dim, int k);
 void   agent_db_memory_set_scalar(AgentDB *adb, const char *key, const char *val);
+
+/* Store/retrieve embedding vector on a MEMORY node. */
+int    agent_db_memory_store_embedding(AgentDB *adb, const char *memory_id,
+                                       const float *vec, int dim);
+int    agent_db_memory_get_embedding(AgentDB *adb, const char *memory_id,
+                                     float **out_vec, int *out_dim);
 char  *agent_db_memory_get_scalar(AgentDB *adb, const char *key);
 void   agent_db_memory_increment(AgentDB *adb, const char *key);
 int    agent_db_memory_step_count(AgentDB *adb);
@@ -126,22 +132,32 @@ char *agent_db_cache_get(AgentDB *adb, const char *hash);
 int   agent_db_cache_set(AgentDB *adb, const char *task_id,
                          const char *hash, const char *response);
 
-/* ========================= Scripts (Phase 4 — stub) ========================= */
+/* ========================= Scripts (Phase 4) ========================= */
 
 char  *agent_db_script_store(AgentDB *adb, const char *name,
                              const char *desc, const char *tool_seq);
-cJSON *agent_db_script_match(AgentDB *adb, const float *vec, int dim);
+cJSON *agent_db_script_match(AgentDB *adb, const char *query);
+
+/* Extract tool sequence from a completed task and store as a SCRIPT. Returns script name (caller frees). */
+char  *agent_db_task_extract_script(AgentDB *adb, const char *task_id);
 
 /* ========================= Logging ========================= */
 
 void agent_db_log_event(AgentDB *adb, const char *type, int iter,
-                        const char *stage, const char *json, int success);
+                        const char *stage, const char *json, int success,
+                        const char *task_id);
 
 /* ========================= Analytics ========================= */
 
 cJSON *agent_db_tasks_failed_ranked(AgentDB *adb);
-cJSON *agent_db_tools_unused(AgentDB *adb);
+cJSON *agent_db_tools_unused(AgentDB *adb, const char **known_tools, int count);
 cJSON *agent_db_file_workflow(AgentDB *adb, const char *path);
+
+/* Graph compaction: delete old LOG_EVENT, unused PROMPT_CACHE, orphaned TOOL_CALL nodes. */
+int   agent_db_compact(AgentDB *adb, int max_age_days);
+
+/* Task diff: compare tool sequences of two tasks. */
+cJSON *agent_db_task_diff(AgentDB *adb, const char *id_a, const char *id_b);
 
 /* ========================= Graph Stats ========================= */
 
