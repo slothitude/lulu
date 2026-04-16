@@ -203,6 +203,29 @@ Task *tasks_next_runnable(void) {
     return best;
 }
 
+int tasks_get_runnable(Task **out, int max) {
+    time_t now = time(NULL);
+    int count = 0;
+
+    for (int i = 0; i < g_task_count && count < max; i++) {
+        Task *t = &g_tasks[i];
+
+        if (strcmp(t->status, "done") == 0) continue;
+        if (strcmp(t->status, "running") == 0) continue;
+
+        if (strcmp(t->status, "failed") == 0) {
+            int cooldown = 30 * t->attempts;
+            if (cooldown > 300) cooldown = 300;
+            if (t->max_attempts > 0 && t->attempts >= t->max_attempts) continue;
+            if (difftime(now, t->updated_at) < cooldown) continue;
+        }
+
+        out[count++] = t;
+    }
+
+    return count;
+}
+
 void tasks_update(Task *t, const char *status, const char *result) {
     if (!t) return;
     strncpy(t->status, status, TASK_STATUS_MAX - 1);

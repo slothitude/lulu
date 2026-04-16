@@ -46,6 +46,7 @@ if "%DO_BUILD%"=="1" (
     gcc -std=c11 -D_CRT_SECURE_NO_WARNINGS -I include -c channel.c -o ..\build\channel.o
     gcc -std=c11 -D_CRT_SECURE_NO_WARNINGS -I include -c tasks.c -o ..\build\tasks.o
     gcc -std=c11 -D_CRT_SECURE_NO_WARNINGS -I include -c session.c -o ..\build\session.o
+    gcc -std=c11 -D_CRT_SECURE_NO_WARNINGS -I include -c decision_engine.c -o ..\build\decision_engine.o
     gcc -std=c11 -D_CRT_SECURE_NO_WARNINGS -I include -c subscribers\log_subscriber.c -o ..\build\log_subscriber.o
     gcc -std=c11 -D_CRT_SECURE_NO_WARNINGS -I include -c subscribers\mem_subscriber.c -o ..\build\mem_subscriber.o
     gcc -std=c11 -D_CRT_SECURE_NO_WARNINGS -I include -c subscribers\sdl3_debugger.c -o ..\build\sdl3_debugger.o
@@ -57,6 +58,7 @@ if "%DO_BUILD%"=="1" (
     g++ ..\build\main.o ..\build\sandbox.o ..\build\tools.o ^
         ..\build\llm.o ..\build\state.o ..\build\agent_config.o ^
         ..\build\event_bus.o ..\build\channel.o ..\build\tasks.o ..\build\session.o ^
+        ..\build\decision_engine.o ^
         ..\build\log_subscriber.o ..\build\mem_subscriber.o ^
         ..\build\sdl3_debugger.o ..\build\tg_subscriber.o ..\build\telegram.o ^
         ..\build\cJSON.o ^

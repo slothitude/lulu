@@ -19,6 +19,7 @@
 #include "channel.h"
 #include "tasks.h"
 #include "session.h"
+#include "decision_engine.h"
 
 /* Portable asprintf for MSVC */
 static int port_asprintf(char **ret, const char *fmt, ...) {
@@ -340,6 +341,9 @@ static void execute_task(Task *t, const char *workspace) {
     /* Log task execution */
     state_log_stage(g_log_path, t->attempts, "task",
                     t->prompt, strcmp(t->status, "done") == 0);
+
+    /* Decision engine learning */
+    decision_learn(t->id, strcmp(t->status, "done") == 0);
 }
 
 /* ========================= Agent Think ========================= */
@@ -423,6 +427,15 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
         return;
     }
 
+    if (strcmp(text, "/decide") == 0) {
+        char debug[1024];
+        decision_debug_last(debug, sizeof(debug));
+        char reply[1200];
+        snprintf(reply, sizeof(reply), "Last decision: %s", debug);
+        channels_reply(ev->chat_id, reply);
+        return;
+    }
+
     if (strncmp(text, "/goal ", 6) == 0) {
         const char *goal_text = text + 6;
         if (!goal_text[0]) {
@@ -458,7 +471,7 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
 
     /* Unknown command */
     channels_reply(ev->chat_id,
-        "Commands: /stop /clear /status /files /tasks /goal <text>");
+        "Commands: /stop /clear /status /files /tasks /decide /goal <text>");
 }
 
 /* ========================= Message Handler ========================= */
@@ -826,6 +839,11 @@ static int core_init(const char *tools_dir) {
     memory_load(&g_mem, g_memory_path);
     g_mem.started_at = time(NULL);
 
+    /* Decision engine */
+    DecisionConfig dcfg = { .epsilon = 0.1f, .max_candidates = 10 };
+    decision_init(dcfg);
+    printf("[INIT] Decision engine initialized (epsilon=%.2f)\n", dcfg.epsilon);
+
     /* Event bus */
     event_bus_init();
     log_subscriber_init(g_log_path);
@@ -844,10 +862,15 @@ static DWORD WINAPI worker_thread_func(LPVOID param) {
         /* Agent think — state-driven reasoning */
         agent_think();
 
-        /* Get next runnable task (under lock) */
-        tasks_lock();
-        Task *t = tasks_next_runnable();
-        tasks_unlock();
+        /* Get next runnable task via decision engine */
+        char picked_id[TASK_ID_MAX] = {0};
+        int has_task = decision_pick_task(picked_id);
+        Task *t = NULL;
+        if (has_task) {
+            tasks_lock();
+            t = tasks_find(picked_id);
+            tasks_unlock();
+        }
 
         if (t) {
             g_worker_busy = 1;

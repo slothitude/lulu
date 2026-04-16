@@ -60,6 +60,10 @@ Task *tasks_find(const char *id);
 /* List all tasks (for /tasks command). Prints to supplied buffer. */
 void tasks_list(char *buf, size_t buf_size);
 
+/* Get runnable task candidates (pending + failed past cooldown). Fills out[] with
+   pointers into internal storage. Returns count (0 if none eligible). */
+int tasks_get_runnable(Task **out, int max);
+
 /* Thread safety — initialize before multi-threaded access */
 void tasks_init_lock(void);
 void tasks_lock(void);
