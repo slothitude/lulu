@@ -74,7 +74,7 @@ jobs:
           # 4. buffer_manager.cpp — guard SEH for MinGW (no _set_se_translator)
           BM=src/storage/buffer_manager/buffer_manager.cpp
           if [ -f "$BM" ]; then
-            python3 -c "
+            python -c "
           import sys
           with open('$BM', 'r') as f: c = f.read()
           # Wrap the SEH block (uses _set_se_translator) with _MSC_VER guard
