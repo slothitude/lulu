@@ -76,6 +76,15 @@ static void load_behavior(cJSON *parent, Behavior *b) {
     b->enable_prompt_cache = cJSON_IsBool(item) ? item->valueint : 0;
 
     load_prompt_field(parent, "cache_path", b->cache_path, sizeof(b->cache_path));
+
+    item = cJSON_GetObjectItem(parent, "enable_debug_view");
+    b->enable_debug_view = cJSON_IsBool(item) ? item->valueint : 0;
+
+    item = cJSON_GetObjectItem(parent, "enable_telegram");
+    b->enable_telegram = cJSON_IsBool(item) ? item->valueint : 0;
+
+    load_prompt_field(parent, "telegram_bot_token", b->telegram_bot_token, sizeof(b->telegram_bot_token));
+    load_prompt_field(parent, "telegram_chat_id", b->telegram_chat_id, sizeof(b->telegram_chat_id));
 }
 
 int agent_config_load(AgentConfig *ac, const char *path) {

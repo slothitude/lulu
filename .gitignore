@@ -6,9 +6,19 @@ state/log.txt
 state/log.jsonl
 state/memory.json
 state/prompt_cache.json
+state/tasks.json
 
 # Workspace content
 workspace/
 
+# Telegram data
+tg_data/
+
 # Config with secrets
 config.json
+
+# Built DLLs
+tools/*.dll
+
+# Static libraries (TDLib build deps)
+libs/

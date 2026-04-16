@@ -7,6 +7,7 @@
 #include "state.h"
 #include "agent_config.h"
 #include "agent_core.h"
+#include "event_bus.h"
 
 extern AgentConfig g_agent_cfg;
 
@@ -77,7 +78,8 @@ static char *build_critic_context(const char *log_path, WorkingMemory *mem, cons
     return context;
 }
 
-CriticResult critic_run(const char *log_path, WorkingMemory *mem, const char *goal, int iteration) {
+CriticResult critic_run(WorkingMemory *mem, const char *goal, int iteration,
+                        const char *log_path) {
     CriticResult result = default_critic_result();
 
     char *context = build_critic_context(log_path, mem, goal);
@@ -88,10 +90,20 @@ CriticResult critic_run(const char *log_path, WorkingMemory *mem, const char *go
     AgentRaw raw = agent_run_call(&call);
     free(context);
 
-    /* Log raw LLM response */
-    state_log_llm(log_path, iteration, "critic", "critic evaluation",
-                  raw.llm_response, raw.raw_json, raw.parsed ? 1 : 0,
-                  raw.prompt_hash, raw.cache_hit);
+    /* Log raw LLM response via event bus */
+    {
+        Event ev = {0};
+        ev.type = EVENT_LLM_CALL;
+        ev.llm_call.iteration      = iteration;
+        ev.llm_call.stage          = "critic";
+        ev.llm_call.prompt_summary = "critic evaluation";
+        ev.llm_call.raw_response   = raw.llm_response;
+        ev.llm_call.parsed_json    = raw.raw_json;
+        ev.llm_call.success        = raw.parsed ? 1 : 0;
+        ev.llm_call.prompt_hash    = raw.prompt_hash;
+        ev.llm_call.cache_hit      = raw.cache_hit;
+        event_bus_publish(EVENT_LLM_CALL, &ev);
+    }
 
     if (!raw.parsed) {
         fprintf(stderr, "[CRITIC] LLM call failed\n");

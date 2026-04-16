@@ -61,6 +61,10 @@
     "dry_run": false,
     "max_steps_per_iteration": 0,
     "enable_prompt_cache": true,
-    "cache_path": "state/prompt_cache.json"
+    "cache_path": "state/prompt_cache.json",
+    "enable_debug_view": false,
+    "enable_telegram": true,
+    "telegram_bot_token": "8709247078:AAFN78hNX-0fGW8zN0-yBmkZP4qAK3ZlKX8",
+    "telegram_chat_id": "5597932516"
   }
 }

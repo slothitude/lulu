@@ -46,6 +46,10 @@ typedef struct {
     int   max_steps_per_iteration;
     int   enable_prompt_cache;
     char  cache_path[256];
+    int   enable_debug_view;
+    int   enable_telegram;
+    char  telegram_bot_token[256];
+    char  telegram_chat_id[32];
 } Behavior;
 
 /* Full agent config loaded from agent.json */

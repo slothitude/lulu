@@ -407,6 +407,88 @@ char *llm_chat(const char *prompt, int max_retries) {
     return NULL;
 }
 
+/* ========================= Multi-Turn Chat ========================= */
+
+char *llm_chat_multi(ChatMessage *msgs, int count, int max_retries) {
+    if (!msgs || count <= 0) return NULL;
+
+    /* Build messages JSON array */
+    /* Each message: {"role":"xxx","content":"escaped_content"} */
+    /* Worst case: each content char becomes 6 chars when escaped */
+    size_t buf_size = 512;  /* overhead */
+    for (int i = 0; i < count; i++) {
+        buf_size += 64 + (msgs[i].content ? strlen(msgs[i].content) * 6 + 2 : 4);
+    }
+    buf_size += 256;  /* model, temperature, etc. */
+
+    char *payload = (char *)malloc(buf_size);
+    if (!payload) return NULL;
+
+    int pos = snprintf(payload, buf_size,
+        "{\"model\":\"%s\",\"messages\":[", g_model);
+
+    for (int i = 0; i < count; i++) {
+        if (i > 0) payload[pos++] = ',';
+
+        if (!msgs[i].content) {
+            pos += snprintf(payload + pos, buf_size - pos,
+                "{\"role\":\"%s\",\"content\":\"\"}", msgs[i].role);
+        } else {
+            char *escaped = llm_escape_json_string(msgs[i].content);
+            if (!escaped) {
+                free(payload);
+                return NULL;
+            }
+            pos += snprintf(payload + pos, buf_size - pos,
+                "{\"role\":\"%s\",\"content\":\"%s\"}", msgs[i].role, escaped);
+            free(escaped);
+        }
+    }
+
+    pos += snprintf(payload + pos, buf_size - pos,
+        "],\"temperature\":0.3,\"max_tokens\":4096}");
+
+    for (int i = 0; i < max_retries; i++) {
+        char *resp = http_post(g_endpoint, payload);
+        if (!resp) {
+            fprintf(stderr, "[LLM] Transport error (multi-turn), retry %d/%d\n", i + 1, max_retries);
+            Sleep(1000 * (i + 1));
+            continue;
+        }
+
+        if (strlen(resp) > MAX_RESPONSE_SIZE) {
+            free(resp);
+            continue;
+        }
+
+        cJSON *root = cJSON_Parse(resp);
+        if (!root) {
+            free(resp);
+            continue;
+        }
+
+        cJSON *choices = cJSON_GetObjectItem(root, "choices");
+        cJSON *first = cJSON_GetArrayItem(choices, 0);
+        cJSON *msg = cJSON_GetObjectItem(first, "message");
+        cJSON *content = cJSON_GetObjectItem(msg, "content");
+
+        if (!cJSON_IsString(content)) {
+            cJSON_Delete(root);
+            free(resp);
+            continue;
+        }
+
+        char *result = str_dup(content->valuestring);
+        cJSON_Delete(root);
+        free(resp);
+        free(payload);
+        return result;
+    }
+
+    free(payload);
+    return NULL;
+}
+
 /* ========================= JSON Extraction ========================= */
 
 static char *extract_between(const char *src, const char *start, const char *end) {

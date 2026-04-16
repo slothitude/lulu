@@ -7,11 +7,12 @@
 #include "state.h"
 #include "agent_config.h"
 #include "agent_core.h"
+#include "event_bus.h"
 
 extern AgentConfig g_agent_cfg;
 
 PlannerStep *planner_run(const char *goal, WorkingMemory *mem, const char *extra_hint,
-                         int *count, const char *log_path, int iteration) {
+                         int *count, int iteration) {
     *count = 0;
 
     /* Build context body */
@@ -32,10 +33,20 @@ PlannerStep *planner_run(const char *goal, WorkingMemory *mem, const char *extra
     AgentCall call = { &g_agent_cfg.planner, g_agent_cfg.shared.tools_list, context, 3 };
     AgentRaw raw = agent_run_call(&call);
 
-    /* Log raw LLM response */
-    state_log_llm(log_path, iteration, "planner", context,
-                  raw.llm_response, raw.raw_json, raw.parsed ? 1 : 0,
-                  raw.prompt_hash, raw.cache_hit);
+    /* Log raw LLM response via event bus */
+    {
+        Event ev = {0};
+        ev.type = EVENT_LLM_CALL;
+        ev.llm_call.iteration      = iteration;
+        ev.llm_call.stage          = "planner";
+        ev.llm_call.prompt_summary = context;
+        ev.llm_call.raw_response   = raw.llm_response;
+        ev.llm_call.parsed_json    = raw.raw_json;
+        ev.llm_call.success        = raw.parsed ? 1 : 0;
+        ev.llm_call.prompt_hash    = raw.prompt_hash;
+        ev.llm_call.cache_hit      = raw.cache_hit;
+        event_bus_publish(EVENT_LLM_CALL, &ev);
+    }
 
     if (!raw.parsed) {
         fprintf(stderr, "[PLANNER] LLM call failed\n");

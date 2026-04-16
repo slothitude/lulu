@@ -237,11 +237,14 @@ static cJSON *sdl3_render(cJSON *args, const char *workspace, char **error) {
 
         SDL_Window *window;
         SDL_Renderer *renderer;
-        if (!SDL_Init(SDL_INIT_VIDEO)) {
-            char buf[256];
-            snprintf(buf, sizeof(buf), "SDL3 init error: %s", SDL_GetError());
-            *error = _strdup(buf);
-            return NULL;
+        int was_init = SDL_WasInit(SDL_INIT_VIDEO);
+        if (!was_init) {
+            if (!SDL_Init(SDL_INIT_VIDEO)) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "SDL3 init error: %s", SDL_GetError());
+                *error = _strdup(buf);
+                return NULL;
+            }
         }
         if (!SDL_CreateWindowAndRenderer(title, width, height, 0, &window, &renderer)) {
             char buf[256];
@@ -270,7 +273,7 @@ static cJSON *sdl3_render(cJSON *args, const char *workspace, char **error) {
         Uint64 duration = SDL_GetTicks() - start;
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
-        SDL_Quit();
+        if (!was_init) SDL_Quit();
 
         cJSON *r = cJSON_CreateObject();
         cJSON_AddStringToObject(r, "status", "shown");
@@ -292,13 +295,16 @@ static cJSON *sdl3_render(cJSON *args, const char *workspace, char **error) {
         char *full_path = sandbox_resolve_path(path_buf, workspace);
         if (!full_path) TOOL_ERROR("path traversal blocked or invalid path");
 
-        /* Initialize SDL video subsystem */
-        if (!SDL_Init(SDL_INIT_VIDEO)) {
-            char buf[256];
-            snprintf(buf, sizeof(buf), "SDL3 init error: %s", SDL_GetError());
-            free(full_path);
-            *error = _strdup(buf);
-            return NULL;
+        /* Initialize SDL video subsystem (guard for debugger coexistence) */
+        int render_was_init = SDL_WasInit(SDL_INIT_VIDEO);
+        if (!render_was_init) {
+            if (!SDL_Init(SDL_INIT_VIDEO)) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "SDL3 init error: %s", SDL_GetError());
+                free(full_path);
+                *error = _strdup(buf);
+                return NULL;
+            }
         }
 
         /* Use software renderer with surface for reliable offscreen rendering */
@@ -306,7 +312,7 @@ static cJSON *sdl3_render(cJSON *args, const char *workspace, char **error) {
         if (!surface) {
             char buf[256];
             snprintf(buf, sizeof(buf), "SDL3 surface error: %s", SDL_GetError());
-            SDL_Quit();
+            if (!render_was_init) SDL_Quit();
             free(full_path);
             *error = _strdup(buf);
             return NULL;
@@ -317,7 +323,7 @@ static cJSON *sdl3_render(cJSON *args, const char *workspace, char **error) {
             char buf[256];
             snprintf(buf, sizeof(buf), "SDL3 renderer error: %s", SDL_GetError());
             SDL_DestroySurface(surface);
-            SDL_Quit();
+            if (!render_was_init) SDL_Quit();
             free(full_path);
             *error = _strdup(buf);
             return NULL;
@@ -346,7 +352,7 @@ static cJSON *sdl3_render(cJSON *args, const char *workspace, char **error) {
 
         SDL_DestroyRenderer(renderer);
         SDL_DestroySurface(surface);
-        SDL_Quit();
+        if (!render_was_init) SDL_Quit();
 
         if (!save_ok) {
             char buf[512];

@@ -1,9 +1,18 @@
 #pragma once
+#include <time.h>
 #include "cJSON.h"
 
 #define MAX_MEMORY_FILES   10
 #define MAX_MEMORY_ERRORS  5
+#define MAX_GOALS          8
 #define LLM_LOG_MAX        4096
+
+typedef struct {
+    char id[32];
+    char text[1024];
+    char status[16];      /* "active", "done", "cancelled" */
+    time_t created_at;
+} Goal;
 
 typedef struct {
     char files_created[MAX_MEMORY_FILES][256];
@@ -14,6 +23,12 @@ typedef struct {
     char last_tool[64];
     int  step_count;
     char summary[512];
+    /* Goals */
+    Goal goals[MAX_GOALS];
+    int  goals_count;
+    /* Agent stats */
+    time_t started_at;
+    long long total_messages;
 } WorkingMemory;
 
 typedef struct {

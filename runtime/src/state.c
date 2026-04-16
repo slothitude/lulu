@@ -170,6 +170,30 @@ int memory_load(WorkingMemory *mem, const char *path) {
     cJSON *step_count = cJSON_GetObjectItem(root, "step_count");
     if (cJSON_IsNumber(step_count)) mem->step_count = step_count->valueint;
 
+    /* Goals */
+    cJSON *goals = cJSON_GetObjectItem(root, "goals");
+    if (cJSON_IsArray(goals)) {
+        int count = cJSON_GetArraySize(goals);
+        if (count > MAX_GOALS) count = MAX_GOALS;
+        for (int i = 0; i < count; i++) {
+            cJSON *g = cJSON_GetArrayItem(goals, i);
+            Goal *gl = &mem->goals[i];
+            cJSON *f;
+            f = cJSON_GetObjectItem(g, "id");
+            if (cJSON_IsString(f)) strncpy(gl->id, f->valuestring, sizeof(gl->id) - 1);
+            f = cJSON_GetObjectItem(g, "text");
+            if (cJSON_IsString(f)) strncpy(gl->text, f->valuestring, sizeof(gl->text) - 1);
+            f = cJSON_GetObjectItem(g, "status");
+            if (cJSON_IsString(f)) strncpy(gl->status, f->valuestring, sizeof(gl->status) - 1);
+            f = cJSON_GetObjectItem(g, "created_at");
+            if (cJSON_IsNumber(f)) gl->created_at = (time_t)f->valuedouble;
+        }
+        mem->goals_count = count;
+    }
+
+    cJSON *total_msgs = cJSON_GetObjectItem(root, "total_messages");
+    if (cJSON_IsNumber(total_msgs)) mem->total_messages = (long long)total_msgs->valuedouble;
+
     cJSON_Delete(root);
     return 1;
 }
@@ -193,6 +217,19 @@ int memory_save(WorkingMemory *mem, const char *path) {
     cJSON_AddStringToObject(root, "last_tool", mem->last_tool);
     cJSON_AddStringToObject(root, "last_result", mem->last_result);
     cJSON_AddNumberToObject(root, "step_count", mem->step_count);
+
+    /* Goals */
+    cJSON *goals_arr = cJSON_CreateArray();
+    for (int i = 0; i < mem->goals_count && i < MAX_GOALS; i++) {
+        cJSON *g = cJSON_CreateObject();
+        cJSON_AddStringToObject(g, "id", mem->goals[i].id);
+        cJSON_AddStringToObject(g, "text", mem->goals[i].text);
+        cJSON_AddStringToObject(g, "status", mem->goals[i].status);
+        cJSON_AddNumberToObject(g, "created_at", (double)mem->goals[i].created_at);
+        cJSON_AddItemToArray(goals_arr, g);
+    }
+    cJSON_AddItemToObject(root, "goals", goals_arr);
+    cJSON_AddNumberToObject(root, "total_messages", (double)mem->total_messages);
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);

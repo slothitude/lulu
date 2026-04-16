@@ -14,4 +14,4 @@ typedef struct {
 
 /* Run actor for a step. Returns result with allocated cJSON objects. */
 ActorResult actor_run(PlannerStep *step, WorkingMemory *mem, const char *workspace,
-                      const char *log_path, int iteration);
+                      int iteration);

@@ -9,6 +9,7 @@
 #include "sandbox.h"
 #include "agent_config.h"
 #include "agent_core.h"
+#include "event_bus.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -67,7 +68,7 @@ static int step_already_satisfied(PlannerStep *step, const char *workspace) {
 }
 
 ActorResult actor_run(PlannerStep *step, WorkingMemory *mem, const char *workspace,
-                      const char *log_path, int iteration) {
+                      int iteration) {
     ActorResult result = {0};
     result.args = NULL;
     result.result = NULL;
@@ -116,10 +117,20 @@ ActorResult actor_run(PlannerStep *step, WorkingMemory *mem, const char *workspa
         AgentCall call = { &g_agent_cfg.actor, g_agent_cfg.shared.tools_list, context, 2 };
         AgentRaw raw = agent_run_call(&call);
 
-        /* Log raw LLM response */
-        state_log_llm(log_path, iteration, "actor", context,
-                      raw.llm_response, raw.raw_json, raw.parsed ? 1 : 0,
-                      raw.prompt_hash, raw.cache_hit);
+        /* Log raw LLM response via event bus */
+        {
+            Event ev = {0};
+            ev.type = EVENT_LLM_CALL;
+            ev.llm_call.iteration      = iteration;
+            ev.llm_call.stage          = "actor";
+            ev.llm_call.prompt_summary = context;
+            ev.llm_call.raw_response   = raw.llm_response;
+            ev.llm_call.parsed_json    = raw.raw_json;
+            ev.llm_call.success        = raw.parsed ? 1 : 0;
+            ev.llm_call.prompt_hash    = raw.prompt_hash;
+            ev.llm_call.cache_hit      = raw.cache_hit;
+            event_bus_publish(EVENT_LLM_CALL, &ev);
+        }
 
         if (!raw.parsed) {
             result.retries++;
@@ -216,13 +227,7 @@ ActorResult actor_run(PlannerStep *step, WorkingMemory *mem, const char *workspa
             result.success = 1;
         }
 
-        /* Track file creation */
-        if (strcmp(result.tool, "create_file") == 0 && result.success) {
-            cJSON *path_item = cJSON_GetObjectItem(args, "path");
-            if (cJSON_IsString(path_item)) {
-                memory_track_file(mem, path_item->valuestring);
-            }
-        }
+        /* File tracking now handled by mem_subscriber via EVENT_TOOL_RESULT */
 
         break;
     }

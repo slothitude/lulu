@@ -5,6 +5,15 @@ void llm_init(const char *endpoint, const char *model, const char *apikey, int t
 /* Send prompt, return malloc'd content string or NULL */
 char *llm_chat(const char *prompt, int max_retries);
 
+/* Multi-turn chat support */
+typedef struct {
+    char role[16];    /* "system", "user", "assistant" */
+    char *content;    /* malloc'd, owned by caller */
+} ChatMessage;
+
+/* Send multi-turn conversation, return malloc'd assistant reply. No caching. */
+char *llm_chat_multi(ChatMessage *msgs, int count, int max_retries);
+
 /* Multi-pass JSON extraction from LLM response. Returns malloc'd string or NULL. */
 char *llm_extract_json(const char *response);
 
