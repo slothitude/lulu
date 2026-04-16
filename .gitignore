@@ -1,5 +1,6 @@
 # Build artifacts
 runtime/build/
+build/
 
 # Runtime state
 state/log.txt
@@ -7,6 +8,10 @@ state/log.jsonl
 state/memory.json
 state/prompt_cache.json
 state/tasks.json
+state/graph.kuzu/
+
+# V3 migration backups
+state/*.v3.bak
 
 # Workspace content
 workspace/

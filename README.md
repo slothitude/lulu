@@ -1,26 +1,23 @@
-# Lulu v3.1 — Always-On Autonomous Agent
+# Lulu v4.0 — Graph-Native Autonomous Agent
 
-Local autonomous agent with DLL-loaded tools, persistent tasks, and simultaneous CLI + Telegram channels. Written in C11.
+Local autonomous agent with an embedded property graph database, DLL-loaded tools, persistent tasks, and simultaneous CLI + Telegram channels. Written in C11.
 
-**v3.1** adds a two-thread architecture, thread-safe shared state, priority aging, session TTL, and tool result truncation.
+**v4.0** replaces all flat-file storage with an embedded RyuGraph (Kuzu fork) property graph database. Every action, memory, tool use, and decision becomes a permanent traversable node.
 
 ## Quick Start
 
 ```bash
-# From bashagent/
-run.bat              # Agent starts — CLI + Telegram simultaneously
-run.bat --build      # Force rebuild first
+# Build (from bashagent/build/)
+cmake -G "MinGW Makefiles" ..
+cmake --build .
+cp _deps/kuzu-build/src/libryu_shared.dll .
 
-# One-shot: run a single prompt and exit
-echo "text" | run.bat "summarize this"
-run.bat "list all files in workspace"
-
-# Log viewer
-run.bat --replay
-run.bat --replay --last 20 --stage actor
+# Run
+./agent.exe                    # Always-on agent — CLI + Telegram
+./agent.exe "list the files"   # One-shot prompt
+./agent.exe --replay           # Log viewer
+./agent.exe --replay --last 20 --stage actor
 ```
-
-**No flags needed.** No `--chat`, `--listen`, or `--pipeline`. The agent is the default.
 
 ## Architecture
 
@@ -31,27 +28,54 @@ run.bat --replay --last 20 --stage actor
 │  Main Thread (I/O)          Worker Thread            │
 │  ┌──────────────┐           ┌──────────────┐        │
 │  │ poll channels │           │ agent_think() │        │
-│  │  CLI + TG     │           │ next_runnable │        │
+│  │  CLI + TG     │           │ decision_pick │        │
 │  │ route events  │           │ execute_task() │       │
-│  │ → command     │           │ periodic save  │       │
-│  │ → chat+tools  │           │ session prune  │       │
-│  └──────────────┘           │ Sleep on CV    │       │
-│                              └──────────────┘        │
+│  │ → command     │           │ session prune  │       │
+│  │ → chat+tools  │           │ Sleep on CV    │       │
+│  └──────────────┘           └──────────────┘        │
 │                                                      │
-│  Thread safety: CRITICAL_SECTION on tasks, sessions,  │
-│  channel queue. CONDITION_VARIABLE for task wake.    │
+│  ┌──────────────────────────────────────────────┐   │
+│  │          RyuGraph Property Graph              │   │
+│  │                                               │   │
+│  │  Nodes: TASK  MEMORY  GOAL  SESSION  MESSAGE │   │
+│  │         TOOL_CALL  PROMPT_CACHE  FILE  SCRIPT │   │
+│  │         LOG_EVENT                             │   │
+│  │                                               │   │
+│  │  Rels:  CALLED  USED  RECORDED_IN             │   │
+│  └──────────────────────────────────────────────┘   │
 │                                                      │
 │  Channels:  CLI (stdin) + Telegram (TDLib)           │
-│  Tasks:     tasks.json (survives restart)            │
-│  Sessions:  per-chat history (linked list, dynamic)  │
 │  Tools:     DLL system (runtime-loaded)              │
 │  LLM:       OpenAI-compatible (WinHTTP)              │
 └─────────────────────────────────────────────────────┘
 ```
 
+### Graph Schema
+
+All state lives in an embedded property graph. No flat JSON files.
+
+| Node Table | Key Fields | Purpose |
+|------------|-----------|---------|
+| TASK | id, name, prompt, status, priority, plan, state | Autonomous tasks |
+| MEMORY | id, category, key, content, val | Working memory scalars |
+| GOAL | id, text, status | Active goals |
+| SESSION | id, chat_id, channel | Per-chat sessions |
+| MESSAGE | id, session_id, role, content, seq | Chat history |
+| TOOL_CALL | id, tool, args_json, result_json, duration_ms | Tool invocations |
+| PROMPT_CACHE | hash, response, hit_count | LLM response cache |
+| FILE | id, path, hash, size | File tracking |
+| SCRIPT | id, name, tool_sequence | Mined workflows |
+| LOG_EVENT | id, type, stage, json_data, success | Execution log |
+
+| Rel Table | From → To | Purpose |
+|-----------|-----------|---------|
+| CALLED | TASK → TOOL_CALL | Task tool invocations |
+| USED | TASK → FILE | Files touched by task |
+| RECORDED_IN | LOG_EVENT → TASK | Log event linkage |
+
 ### execute_task() — Structured Autonomy
 
-Tasks don't just "LLM → tool → repeat". They run through internal phases:
+Tasks run through internal phases:
 
 1. **Plan** — LLM generates approach using task prompt + previous state
 2. **Act** — Tool execution loop (capped at 8 tool steps)
@@ -59,54 +83,61 @@ Tasks don't just "LLM → tool → repeat". They run through internal phases:
 
 Each task carries rolling `state`, `last_error`, and `plan` fields so retries aren't blind.
 
-### Priority + Cooldown Scheduler
+### Decision Engine — Scored Task Scheduling
 
-`tasks_next_runnable()` picks the highest-priority eligible task:
-- Pending tasks run immediately
-- Failed tasks retry after cooldown (30s × attempts, capped at 300s max)
-- Permanently failed (max_attempts reached) are skipped
-- Priority aging: tasks waiting > 60s get +1 effective priority (cap 10)
+`decision_pick_task()` replaces simple FIFO with scored selection:
+- **Priority** (2x weight), **age bonus** (1.5x, caps at 5min), **failure penalty** (1.5x per attempt)
+- **10% epsilon-greedy exploration** — random selection to avoid local optima
+- `decision_learn(task_id, success)` updates scoring after execution
 
-### Robustness Features
+### v3 → v4 Migration
 
-- **Session TTL**: idle sessions pruned after 1 hour (`session_prune`)
-- **Tool result truncation**: results > 4KB truncated to prevent context explosion
-- **Worker status**: `/status` shows `Worker: BUSY` or `Worker: IDLE`
-- **Thread safety**: `CRITICAL_SECTION` guards on tasks, sessions, and channel queue; `CONDITION_VARIABLE` wakes worker on new tasks
+On first run, v4 automatically imports data from v3 flat files:
+- `state/tasks.json` → TASK nodes
+- `state/memory.json` → MEMORY nodes
+- `state/prompt_cache.json` → PROMPT_CACHE nodes
+
+Original files are renamed to `.v3.bak`. Migration only runs once (skipped if graph has data).
 
 ## Directory Structure
 
 ```
 bashagent/
-├── run.bat                    # Build + run entrypoint
-├── config.json                # LLM credentials (not committed)
-├── agent.json                 # Agent behavior config
+├── CMakeLists.txt              # CMake build (FetchContent for RyuGraph)
+├── run.bat                     # Build + run entrypoint
+├── config.json                 # LLM credentials (not committed)
+├── agent.json                  # Agent behavior config
 ├── runtime/
-│   ├── build/agent.exe        # Built binary
 │   ├── src/
 │   │   ├── main.c             # Core loop, message handling, one-shot
+│   │   ├── agent_db.c         # Graph storage layer (RyuGraph)
 │   │   ├── channel.c          # Unified CLI + Telegram input
-│   │   ├── tasks.c            # Persistent task system
-│   │   ├── session.c          # Per-chat history management
+│   │   ├── tasks.c            # Task system (delegates to agent_db)
+│   │   ├── session.c          # Per-chat history (graph-backed)
 │   │   ├── llm.c              # OpenAI-compatible HTTP client (WinHTTP)
 │   │   ├── tools.c            # DLL tool loader
 │   │   ├── sandbox.c          # Path traversal protection
-│   │   ├── state.c            # Memory, goals, logging, file I/O
+│   │   ├── state.c            # Memory, goals, logging (graph-backed)
+│   │   ├── decision_engine.c  # Scored task scheduler
 │   │   ├── agent_config.c     # JSON config loader
 │   │   ├── event_bus.c        # Synchronous pub/sub
 │   │   ├── telegram.c         # TDLib JSON wrapper
 │   │   ├── cJSON.c            # Vendored JSON parser
-│   │   ├── include/           # Headers
+│   │   ├── include/
+│   │   │   ├── agent_db.h     # Graph storage API
+│   │   │   ├── tasks.h        # Task types (DbTask alias)
+│   │   │   └── ...
 │   │   ├── subscribers/       # Event bus subscribers (log, mem, SDL3, TG)
 │   │   └── tools/             # Tool DLL sources
 │   └── tools/                 # Built DLLs
+├── build/                      # CMake build directory
+│   ├── agent.exe              # Built binary
+│   └── libryu_shared.dll      # RyuGraph shared library
 ├── tools/                     # Runtime-loaded tool DLLs
 ├── workspace/                 # Sandboxed file operations root
 └── state/
-    ├── log.jsonl              # Execution log (JSONL)
-    ├── memory.json            # Persistent working memory + goals
-    ├── tasks.json             # Persistent task queue
-    └── prompt_cache.json      # LLM response cache
+    ├── graph.kuzu             # Property graph database
+    └── log.jsonl              # Execution log (JSONL, also in graph)
 ```
 
 ## Commands (work from any channel)
@@ -115,10 +146,12 @@ bashagent/
 |---------|--------|
 | `/stop` | Shutdown agent |
 | `/clear` | Clear this chat's history |
-| `/status` | Show uptime, steps, messages, tasks |
+| `/status` | Show uptime, steps, messages, tasks, graph stats |
 | `/files` | List workspace files |
 | `/tasks` | Show all tasks with status |
-| `/goal <text>` | Create a high-priority task |
+| `/decide` | Show last decision engine debug info |
+| `/goal <text>` | Create a high-priority autonomous task |
+| `/graph <cypher>` | Run read-only Cypher query on the graph |
 
 ## Configuration
 
@@ -150,7 +183,6 @@ bashagent/
   "behavior": {
     "max_iterations": 10,
     "enable_prompt_cache": true,
-    "cache_path": "state/prompt_cache.json",
     "enable_telegram": true,
     "telegram_bot_token": "your-bot-token",
     "telegram_chat_id": "123456789"
@@ -205,15 +237,12 @@ TOOL_EXPORT const ToolInfo *tool_get_info(void) { return &info; }
 TOOL_EXPORT tool_execute_fn tool_get_execute(void) { return my_tool; }
 ```
 
-2. It auto-compiles with `run.bat --build`.
-
-## Prompt Cache
-
-LLM responses are cached using FNV-1a 64-bit hash deduplication. Identical prompts skip the HTTP call. Cache persists across runs as JSON.
+2. Rebuild with `cmake --build build`.
 
 ## Build Requirements
 
 - [MSYS2](https://www.msys2.org/) with MinGW64 GCC 15+
+- CMake 3.20+
 - SDL3 + SDL3_image (for sdl3_render tool)
 - TDLib (for Telegram integration)
 - WinHTTP (system library)
@@ -224,6 +253,7 @@ LLM responses are cached using FNV-1a 64-bit hash deduplication. Identical promp
 - Path traversal (`..`, absolute paths, system dirs) blocked
 - No arbitrary command execution
 - Tool DLLs have no LLM access
+- `/graph` command restricted to read-only MATCH/RETURN queries
 - `config.json` excluded from git (contains API key)
 
 ## License

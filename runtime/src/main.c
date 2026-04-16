@@ -11,6 +11,7 @@
 #include "tools.h"
 #include "sandbox.h"
 #include "agent_config.h"
+#include "agent_db.h"
 #include "event_bus.h"
 #include "subscribers/log_subscriber.h"
 #include "subscribers/mem_subscriber.h"
@@ -41,12 +42,15 @@ static int port_asprintf(char **ret, const char *fmt, ...) {
 
 static AgentConfig g_agent_cfg;
 static Config g_cfg;
-static WorkingMemory g_mem;
+static WorkingMemory g_mem;       /* in-memory mirror, backed by graph */
+AgentDB g_adb;                    /* graph database — shared across modules */
 static char g_base_dir[MAX_PATH];
 static char g_workspace_path[MAX_PATH];
 static char g_log_path[MAX_PATH];
 static char g_memory_path[MAX_PATH];
 static char g_tasks_path[MAX_PATH];
+static char g_graph_path[MAX_PATH];
+static char g_cache_path[MAX_PATH];
 static volatile int g_running = 1;
 static time_t g_start_time;
 
@@ -75,7 +79,7 @@ static BOOL WINAPI agent_ctrl_handler(DWORD ctrl) {
 
 static void print_banner(void) {
     printf("========================================\n");
-    printf(" Lulu v3 — Always-On Autonomous Agent\n");
+    printf(" Lulu v4.0 — Graph-Native Autonomous Agent\n");
     printf("========================================\n\n");
 }
 
@@ -390,12 +394,19 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
         int total = tasks_count(NULL);
         int pending = tasks_count("pending");
         int done = tasks_count("done");
+        int failed = tasks_count("failed");
         tasks_unlock();
+        int64_t nodes = agent_db_node_count(&g_adb);
+        int64_t rels = agent_db_rel_count(&g_adb);
         snprintf(status, sizeof(status),
-            "Uptime: %dh %dm | Steps: %d | Messages: %lld | Tasks: %d (%d pending, %d done) | Worker: %s",
+            "Lulu v4.0  uptime %dh%dm  steps %d  msgs %lld\n"
+            "Worker: %s\n"
+            "Tasks: %d pending  %d done  %d failed\n"
+            "Graph: %lld nodes  %lld edges",
             h, m, g_mem.step_count, g_mem.total_messages,
-            total, pending, done,
-            g_worker_busy ? "BUSY" : "IDLE");
+            g_worker_busy ? "BUSY" : "IDLE",
+            pending, done, failed,
+            (long long)nodes, (long long)rels);
         channels_reply(ev->chat_id, status);
         return;
     }
@@ -436,6 +447,54 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
         return;
     }
 
+    if (strncmp(text, "/graph ", 7) == 0) {
+        const char *query = text + 7;
+        /* Security: only allow read-only queries */
+        if (strncmp(query, "MATCH", 5) != 0 && strncmp(query, "RETURN", 6) != 0) {
+            channels_reply(ev->chat_id, "Only MATCH/RETURN queries allowed.");
+            return;
+        }
+        agent_db_lock();
+        ryu_query_result result;
+        ryu_state state = ryu_connection_query(&g_adb._conn, query, &result);
+        if (state != RyuSuccess || !ryu_query_result_is_success(&result)) {
+            char *err = ryu_query_result_get_error_message(&result);
+            char msg[512];
+            snprintf(msg, sizeof(msg), "Query failed: %s", err ? err : "unknown error");
+            if (err) ryu_destroy_string(err);
+            channels_reply(ev->chat_id, msg);
+            ryu_query_result_destroy(&result);
+            agent_db_unlock();
+            return;
+        }
+        char buf[4096]; buf[0] = 0;
+        size_t pos = 0;
+        uint64_t ncols = ryu_query_result_get_num_columns(&result);
+        while (ryu_query_result_has_next(&result) && pos < sizeof(buf) - 256) {
+            ryu_flat_tuple tuple;
+            ryu_query_result_get_next(&result, &tuple);
+            for (uint64_t c = 0; c < ncols; c++) {
+                ryu_value val;
+                ryu_flat_tuple_get_value(&tuple, c, &val);
+                if (ryu_value_is_null(&val)) {
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, "NULL\t");
+                } else {
+                    char *s = NULL;
+                    ryu_value_get_string(&val, &s);
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\t", s ? s : "");
+                    if (s) ryu_destroy_string(s);
+                }
+                ryu_value_destroy(&val);
+            }
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
+            ryu_flat_tuple_destroy(&tuple);
+        }
+        ryu_query_result_destroy(&result);
+        agent_db_unlock();
+        channels_reply(ev->chat_id, buf[0] ? buf : "(no results)");
+        return;
+    }
+
     if (strncmp(text, "/goal ", 6) == 0) {
         const char *goal_text = text + 6;
         if (!goal_text[0]) {
@@ -471,7 +530,7 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
 
     /* Unknown command */
     channels_reply(ev->chat_id,
-        "Commands: /stop /clear /status /files /tasks /decide /goal <text>");
+        "Commands: /stop /clear /status /files /tasks /decide /goal <text> /graph <cypher>");
 }
 
 /* ========================= Message Handler ========================= */
@@ -764,6 +823,35 @@ static int core_init(const char *tools_dir) {
     snprintf(config_path, MAX_PATH, "%s\\config.json", g_base_dir);
     snprintf(agent_cfg_path, MAX_PATH, "%s\\agent.json", g_base_dir);
 
+    /* ===== Graph Database ===== */
+    agent_db_init_lock();
+    if (!agent_db_open(&g_adb, g_graph_path)) {
+        fprintf(stderr, "[FATAL] Could not open graph database at %s\n", g_graph_path);
+        return 0;
+    }
+    printf("[INIT] Graph database opened\n");
+
+    /* ===== Migration from v3 ===== */
+    if (agent_db_needs_migration(&g_adb)) {
+        int migrated = 0;
+        migrated += agent_db_migrate_tasks_json(&g_adb, g_tasks_path);
+        migrated += agent_db_migrate_memory_json(&g_adb, g_memory_path);
+        migrated += agent_db_migrate_cache_json(&g_adb, g_cache_path);
+        if (migrated > 0) {
+            printf("[INIT] Migrated %d records from v3\n", migrated);
+            /* Rename v3 files */
+            {
+                char bak[MAX_PATH];
+                snprintf(bak, MAX_PATH, "%s\\state\\tasks.json.v3.bak", g_base_dir);
+                rename(g_tasks_path, bak);
+                snprintf(bak, MAX_PATH, "%s\\state\\memory.json.v3.bak", g_base_dir);
+                rename(g_memory_path, bak);
+                snprintf(bak, MAX_PATH, "%s\\state\\prompt_cache.json.v3.bak", g_base_dir);
+                rename(g_cache_path, bak);
+            }
+        }
+    }
+
     if (!config_load(&g_cfg, config_path)) {
         fprintf(stderr, "[FATAL] Could not load config from %s\n", config_path);
         return 0;
@@ -985,11 +1073,7 @@ static void run_agent(void) {
     CloseHandle(worker);
 
     printf("\n[SHUTDOWN] Saving state...\n");
-    tasks_lock();
-    tasks_save();
-    tasks_unlock();
     memory_save(&g_mem, g_memory_path);
-    llm_cache_save();
     channels_shutdown();
     session_free_all();
 
@@ -998,6 +1082,7 @@ static void run_agent(void) {
     tools_cleanup();
 
     DeleteCriticalSection(&g_state_lock);
+    agent_db_close(&g_adb);
     printf("[SHUTDOWN] Done.\n");
 }
 
@@ -1023,6 +1108,8 @@ int main(int argc, char *argv[]) {
     snprintf(g_log_path, MAX_PATH, "%s\\state\\log.jsonl", g_base_dir);
     snprintf(g_memory_path, MAX_PATH, "%s\\state\\memory.json", g_base_dir);
     snprintf(g_tasks_path, MAX_PATH, "%s\\state\\tasks.json", g_base_dir);
+    snprintf(g_graph_path, MAX_PATH, "%s\\state\\graph.kuzu", g_base_dir);
+    snprintf(g_cache_path, MAX_PATH, "%s\\state\\prompt_cache.json", g_base_dir);
 
     /* Parse args */
     int replay_mode = 0;
