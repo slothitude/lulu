@@ -73,3 +73,10 @@ target_link_libraries(agent PRIVATE SDL3 SDL3_image)
 
 # Force C++ linker for TDLib
 set_target_properties(agent PROPERTIES LINKER_LANGUAGE CXX)
+
+# ---- Updater (standalone, no RyuGraph) ----
+add_executable(updater updater/updater.c runtime/src/cJSON.c)
+target_include_directories(updater PRIVATE ${CMAKE_SOURCE_DIR}/runtime/src/include)
+target_link_libraries(updater PRIVATE winhttp ole32 shell32 shlwapi)
+target_compile_definitions(updater PRIVATE _CRT_SECURE_NO_WARNINGS)
+set_target_properties(updater PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")

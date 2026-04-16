@@ -21,6 +21,7 @@
 #include "tasks.h"
 #include "session.h"
 #include "decision_engine.h"
+#include "version.h"
 
 /* Portable asprintf for MSVC */
 static int port_asprintf(char **ret, const char *fmt, ...) {
@@ -54,6 +55,10 @@ static char g_cache_path[MAX_PATH];
 static volatile int g_running = 1;
 static time_t g_start_time;
 
+/* Update state */
+static volatile int g_update_pending = 0;
+static char g_pending_update_version[32] = {0};
+
 /* Limits */
 #define MAX_TOOL_STEPS     8
 #define MAX_TOOL_RESULT_CHARS 4096
@@ -79,7 +84,7 @@ static BOOL WINAPI agent_ctrl_handler(DWORD ctrl) {
 
 static void print_banner(void) {
     printf("========================================\n");
-    printf(" Lulu v4.0 — Graph-Native Autonomous Agent\n");
+    printf(" Lulu v" LULU_VERSION_FULL " — Graph-Native Autonomous Agent\n");
     printf("========================================\n\n");
 }
 
@@ -835,10 +840,134 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
         return;
     }
 
+    /* /update — check for updates */
+    if (strcmp(text, "/update") == 0 || strcmp(text, "/update confirm") == 0) {
+        if (strcmp(text, "/update") == 0) {
+            /* Find updater.exe alongside agent.exe */
+            char updater_path[MAX_PATH];
+            snprintf(updater_path, MAX_PATH, "%s\\updater.exe", g_base_dir);
+            if (GetFileAttributesA(updater_path) == INVALID_FILE_ATTRIBUTES) {
+                channels_reply(ev->chat_id, "updater.exe not found in install directory");
+                return;
+            }
+
+            /* Launch updater --check */
+            char cmd[MAX_PATH * 2];
+            snprintf(cmd, sizeof(cmd), "\"%s\" --check --install-dir \"%s\"",
+                updater_path, g_base_dir);
+
+            STARTUPINFOA si = {0};
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
+            PROCESS_INFORMATION pi = {0};
+
+            if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+                CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                channels_reply(ev->chat_id, "Failed to launch updater.exe");
+                return;
+            }
+
+            WaitForSingleObject(pi.hProcess, 30000);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+
+            /* Read check result */
+            char tmp[MAX_PATH], check_path[MAX_PATH];
+            GetTempPathA(MAX_PATH, tmp);
+            snprintf(check_path, MAX_PATH, "%slulu_update_check.json", tmp);
+
+            FILE *fp = fopen(check_path, "r");
+            if (!fp) {
+                channels_reply(ev->chat_id, "Update check failed (no result file)");
+                return;
+            }
+            fseek(fp, 0, SEEK_END);
+            long fsize = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            char *data = (char *)malloc(fsize + 1);
+            fread(data, 1, fsize, fp);
+            data[fsize] = 0;
+            fclose(fp);
+
+            cJSON *check = cJSON_Parse(data);
+            free(data);
+            if (!check) {
+                channels_reply(ev->chat_id, "Update check failed (invalid result)");
+                return;
+            }
+
+            cJSON *has_update = cJSON_GetObjectItem(check, "has_update");
+            cJSON *msg = cJSON_GetObjectItem(check, "message");
+            cJSON *remote_ver = cJSON_GetObjectItem(check, "remote_version");
+
+            char reply[512];
+            if (cJSON_IsTrue(has_update)) {
+                const char *rv = cJSON_IsString(remote_ver) ? remote_ver->valuestring : "?";
+                snprintf(reply, sizeof(reply),
+                    "Update available: v" LULU_VERSION_STR " -> %s\nRun /update confirm",
+                    rv);
+                g_update_pending = 1;
+                strncpy(g_pending_update_version, rv, sizeof(g_pending_update_version) - 1);
+            } else {
+                snprintf(reply, sizeof(reply), "Already up to date (v" LULU_VERSION_STR ")");
+                g_update_pending = 0;
+            }
+
+            const char *m = cJSON_IsString(msg) ? msg->valuestring : "";
+            if (m[0]) {
+                size_t pos = strlen(reply);
+                snprintf(reply + pos, sizeof(reply) - pos, "\n%s", m);
+            }
+
+            cJSON_Delete(check);
+            channels_reply(ev->chat_id, reply);
+            return;
+        }
+
+        /* /update confirm */
+        if (!g_update_pending) {
+            channels_reply(ev->chat_id, "No pending update. Run /update first.");
+            return;
+        }
+
+        channels_reply(ev->chat_id,
+            "Saving state and starting update...");
+
+        /* Flush all state */
+        memory_save(&g_mem, g_memory_path);
+        tasks_save();
+        llm_cache_save();
+
+        /* Launch updater --apply */
+        char updater_path[MAX_PATH];
+        snprintf(updater_path, MAX_PATH, "%s\\updater.exe", g_base_dir);
+
+        char cmd[MAX_PATH * 2];
+        snprintf(cmd, sizeof(cmd), "\"%s\" --apply --install-dir \"%s\" --restart",
+            updater_path, g_base_dir);
+
+        STARTUPINFOA si = {0};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi = {0};
+
+        if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+            DETACHED_PROCESS | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            channels_reply(ev->chat_id, "Failed to launch updater.exe for apply");
+            return;
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+
+        /* Trigger clean shutdown */
+        g_running = 0;
+        return;
+    }
+
     /* Unknown command */
     channels_reply(ev->chat_id,
         "Commands: /stop /clear /status /files /tasks /decide /goal <text> /graph <cypher> "
-        "/scripts /replay <task_id> /history <n> /diff <id1> <id2>");
+        "/scripts /replay <task_id> /history <n> /diff <id1> <id2> /update");
 }
 
 /* ========================= Message Handler ========================= */

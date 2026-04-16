@@ -27,3 +27,6 @@ tools/*.dll
 
 # Static libraries (TDLib build deps)
 libs/
+
+# Distribution packages
+dist/

@@ -2,7 +2,7 @@
 setlocal
 
 echo ========================================
-echo  Lulu v4.0 — Graph-Native Autonomous Agent
+echo  Lulu v4.1.0 — Graph-Native Autonomous Agent
 echo ========================================
 echo.
 

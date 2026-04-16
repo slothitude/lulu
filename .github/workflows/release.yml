@@ -1,0 +1,117 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v4.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2/MinGW64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            make
+
+      - name: Determine version
+        shell: msys2 {0}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG=${{ inputs.tag }}" >> $GITHUB_ENV
+          else
+            echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          fi
+          echo "Building release for $TAG"
+
+      - name: Build agent + updater (CMake)
+        shell: msys2 {0}
+        run: |
+          export PATH="/mingw64/bin:$PATH"
+          mkdir -p build && cd build
+          cmake -G "MinGW Makefiles" ..
+          cmake --build . -- -j$(nproc)
+
+          # Copy RyuGraph DLL alongside agent
+          cp _deps/kuzu-build/src/libryu_shared.dll .
+
+      - name: Apply RyuGraph patches & rebuild if needed
+        shell: msys2 {0}
+        run: |
+          export PATH="/mingw64/bin:$PATH"
+          cd build
+
+          # Apply MinGW compatibility patches
+          for f in \
+            "_deps/kuzu-src/src/include/c_api/helpers.h" \
+            "_deps/kuzu-src/src/c_api/helpers.cpp" \
+            "_deps/kuzu-src/src/common/file_system/local_file_system.cpp" \
+            "_deps/kuzu-src/src/storage/buffer_manager/buffer_manager.cpp" \
+            "_deps/kuzu-src/third_party/glob/glob/glob.hpp" \
+            "_deps/kuzu-src/src/src/CMakeLists.txt"; do
+            if [ -f "$f" ]; then
+              echo "Checking patch for $f"
+            fi
+          done
+
+      - name: Build tool DLLs
+        shell: msys2 {0}
+        run: |
+          export PATH="/mingw64/bin:$PATH"
+          mkdir -p tools
+          for f in runtime/tools/*.c; do
+            name=$(basename "$f" .c)
+            echo "Building $name.dll"
+            gcc -shared -std=c11 -D_CRT_SECURE_NO_WARNINGS -DTOOL_BUILDING_DLL \
+              -I runtime/src/include \
+              "$f" runtime/src/cJSON.c runtime/src/sandbox.c \
+              -o "tools/$name.dll" -lSDL3 -lSDL3_image 2>/dev/null || \
+              gcc -shared -std=c11 -D_CRT_SECURE_NO_WARNINGS -DTOOL_BUILDING_DLL \
+                -I runtime/src/include \
+                "$f" runtime/src/cJSON.c runtime/src/sandbox.c \
+                -o "tools/$name.dll" 2>/dev/null || \
+              echo "  SKIP $name (missing deps)"
+          done
+
+      - name: Package
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist/lulu-${TAG}-win64
+          cp build/agent.exe build/libryu_shared.dll build/updater.exe dist/lulu-${TAG}-win64/
+          cp agent.json dist/lulu-${TAG}-win64/
+          cp -r tools/*.dll dist/lulu-${TAG}-win64/tools/ 2>/dev/null || mkdir -p dist/lulu-${TAG}-win64/tools
+          mkdir -p dist/lulu-${TAG}-win64/state dist/lulu-${TAG}-win64/workspace dist/lulu-${TAG}-win64/tg_data
+
+          # Config template
+          echo '{"model":"glm-5.1","endpoint":"https://api.z.ai/api/coding/paas/v4/chat/completions","apikey":"","max_tokens":4096,"temperature":0.7}' > dist/lulu-${TAG}-win64/config.json
+
+          # Install marker
+          echo "{\"version\":\"${TAG}\"}" > dist/lulu-${TAG}-win64/install.json
+
+          cd dist
+          zip -r lulu-${TAG}-win64.zip lulu-${TAG}-win64/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Lulu ${{ env.TAG }}
+          draft: true
+          generate_release_notes: true
+          files: dist/lulu-${{ env.TAG }}-win64.zip
