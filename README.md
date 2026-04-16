@@ -211,9 +211,38 @@ tool_execute_fn tool_get_execute(void);     // cJSON *(*fn)(cJSON *args, const c
 | `read_file.dll` | `read_file(path)` | Read file from workspace |
 | `list_files.dll` | `list_files()` | List workspace contents |
 | `run_test.dll` | `run_test()` | Parse test_results.txt |
-| `sdl3_render.dll` | `sdl3_render(action, path, ...)` | Render shapes/text to images |
+| `sdl3_render.dll` | `sdl3_render(action, ...)` | Render shapes/text to images, build widget UIs to PNG |
 | `none.dll` | `none(reason)` | No-op |
 | `telegram_send.dll` | `telegram_send(text)` | Send via Telegram |
+
+### SDL3 Widget System
+
+`sdl3_render.dll` includes a retained-mode widget system for building dashboards and task management UIs. The DLL stays loaded between calls so the widget tree persists across tool invocations.
+
+**18 widgets**: VBoxContainer, HBoxContainer, MarginContainer, CenterContainer, GridContainer, Label, ColorRect, HSeparator, VSeparator, Button, CheckBox, ProgressBar, OptionButton, SpinBox, Panel, PanelContainer, ScrollContainer, TabContainer.
+
+**Actions**:
+| Action | Purpose |
+|--------|---------|
+| `ui_create` | Create widget, returns `node_id` |
+| `ui_set_prop` | Set property (min_w, min_h, text, checked, etc.) |
+| `ui_theme_set` | Override style (bg_color, border_color, corner_radius) |
+| `ui_connect` | Register signal connection |
+| `ui_destroy` | Remove node + subtree |
+| `ui_render_frame` | Layout + render to PNG |
+| `ui_get_tree` | JSON dump of node tree |
+| `ui_clear` | Reset entire tree |
+
+**Example** — building a dashboard:
+```
+ui_create("VBoxContainer", parent=0, {separation: 10})     → node 1
+ui_create("Label", parent=1, {text: "Agent Dashboard"})     → node 2
+ui_create("Button", parent=1, {text: "New Task"})           → node 3
+ui_create("ProgressBar", parent=1, {range_min:0, range_max:100, range_value:75})  → node 4
+ui_render_frame({path: "dashboard.png", width: 600, height: 400})
+```
+
+**Rendering**: Dark theme, `SDL_RenderDebugText` (no TTF), two-pass layout (bottom-up min size, top-down distribution). Size flags: FILL=0, EXPAND=1, SHRINK_CENTER=2.
 
 ### Adding a New Tool
 
