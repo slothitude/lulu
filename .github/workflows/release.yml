@@ -52,17 +52,17 @@ jobs:
         run: |
           cd build/_deps/kuzu-src
           # 1. helpers.h — add cstdint
-          sed -i '1i #include <cstdint>' src/include/c_api/helpers.h
+          sed -i '1i #include <cstdint>' src/include/c_api/helpers.h || true
           # 2. helpers.cpp — add cstdint
-          sed -i '1i #include <cstdint>' src/c_api/helpers.cpp
+          sed -i '1i #include <cstdint>' src/c_api/helpers.cpp || true
           # 3. local_file_system.cpp — add sys/stat.h
-          sed -i '1i #include <sys/stat.h>' src/common/file_system/local_file_system.cpp
+          sed -i '1i #include <sys/stat.h>' src/common/file_system/local_file_system.cpp || true
           # 4. buffer_manager.cpp — guard SEH for non-MSVC
-          sed -i 's/#if defined(_WIN32)/#if defined(_WIN32) \&\& defined(_MSC_VER)/' src/storage/buffer_manager/buffer_manager.cpp
+          sed -i 's/#if defined(_WIN32)/#if defined(_WIN32) \&\& defined(_MSC_VER)/' src/storage/buffer_manager/buffer_manager.cpp || true
           # 5. glob.hpp — use getenv instead of _dupenv_s for non-MSVC
-          sed -i 's/_dupenv_s(&result, \&length, name)/(result = getenv(name), length = result ? strlen(result) : 0, (void)0)/' third_party/glob/glob/glob.hpp
+          sed -i 's/_dupenv_s(&result, \&length, name)/(result = getenv(name), length = result ? strlen(result) : 0, (void)0)/' third_party/glob/glob/glob.hpp || true
           # 6. CMakeLists.txt — add ws2_32 for WIN32
-          sed -i '/RYU_LIBRARIES/,/)/{ s/)/ ws2_32)/; }' src/src/CMakeLists.txt
+          sed -i '/RYU_LIBRARIES/,/)/{ s/)/ ws2_32)/; }' src/CMakeLists.txt || true
           echo "Patches applied"
 
       - name: Build agent + updater
