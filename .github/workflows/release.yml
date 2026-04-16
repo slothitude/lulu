@@ -65,14 +65,12 @@ jobs:
           sed -i '1i #include <sys/stat.h>' src/common/file_system/local_file_system.cpp
           echo "Patched local_file_system.cpp"
 
-          # 4. buffer_manager.cpp — guard SEH with _MSC_VER
+          # 4. buffer_manager.cpp — guard SEH include with _MSC_VER
+          #    The SEH code (#include <eh.h>, _set_se_translator) is under #if defined(_WIN32)
+          #    Replace that specific guard (the one before #include <exception>) with _MSC_VER check
           BM=src/storage/buffer_manager/buffer_manager.cpp
-          # Replace "#if defined(WIN32)" (standalone line) that is followed by "class AccessViolation"
-          awk '
-          /^#if defined\(WIN32\)$/ { line=$0; getline; if (/class AccessViolation/) print "#if defined(WIN32) && defined(_MSC_VER)"; else print line; }
-          { print }
-          ' "$BM" > "$BM.tmp" && mv "$BM.tmp" "$BM"
-          echo "Patched buffer_manager.cpp (SEH guard)"
+          sed -i '/^#if defined(_WIN32)$/{ N; /\n#include <exception>/{ s/^#if defined(_WIN32)/#if defined(_WIN32) \&\& defined(_MSC_VER)/; }; }' "$BM"
+          echo "Patched buffer_manager.cpp"
 
           # 5. glob.hpp — replace _dupenv_s with getenv for MinGW
           sed -i 's/_dupenv_s(\&result, \&length, name)/(result = getenv(name), length = result ? strlen(result) : 0, (void)0)/' third_party/glob/glob/glob.hpp
@@ -84,7 +82,7 @@ jobs:
           # Add ws2_32 to that line
           sed -i 's/set(RYU_LIBRARIES ${RYU_LIBRARIES} Threads::Threads)/set(RYU_LIBRARIES ${RYU_LIBRARIES} Threads::Threads ws2_32)/' "$CL"
           # If no Threads::Threads line, try adding to the base RYU_LIBRARIES line
-          grep -q "ws2_32" "$CL" || sed -i '/if(WIN32)/a\\    set(RYU_LIBRARIES ${RYU_LIBRARIES} ws2_32)' "$CL"
+          grep -q "ws2_32" "$CL" || sed -i '/if(WIN32)/a\    set(RYU_LIBRARIES ${RYU_LIBRARIES} ws2_32)' "$CL"
           echo "Patched src/CMakeLists.txt (ws2_32)"
 
           echo "All patches applied"
