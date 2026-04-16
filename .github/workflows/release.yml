@@ -74,18 +74,10 @@ jobs:
           # 4. buffer_manager.cpp — guard SEH for MinGW (no _set_se_translator)
           BM=src/storage/buffer_manager/buffer_manager.cpp
           if [ -f "$BM" ]; then
-            python -c "
-          import sys
-          with open('$BM', 'r') as f: c = f.read()
-          # Wrap the SEH block (uses _set_se_translator) with _MSC_VER guard
-          c = c.replace('#if defined(WIN32)\nclass AccessViolation',
-                         '#if defined(WIN32) && defined(_MSC_VER)\nclass AccessViolation')
-          # Also add MinGW fallback for the optimistic read section
-          c = c.replace('#if defined(_WIN32) && !defined(_MSC_VER) && !BM_MALLOC',
-                         '#if defined(_WIN32) && !defined(_MSC_VER) && !BM_MALLOC')
-          with open('$BM', 'w') as f: f.write(c)
-          print('Patched buffer_manager.cpp')
-          "
+            # Replace "#if defined(WIN32)" that precedes "class AccessViolation" with _MSC_VER guard
+            # Use awk to do the multi-line-aware replacement
+            awk '/^#if defined\(WIN32\)$/{p=NR} p && NR==p+1 && /class AccessViolation/{gsub(/^#if defined\(WIN32\)$/,"#if defined(WIN32) && defined(_MSC_VER)")} {print}' "$BM" > "$BM.tmp" && mv "$BM.tmp" "$BM"
+            echo "Patched buffer_manager.cpp"
           fi
 
           # 5. glob.hpp — use getenv instead of _dupenv_s for non-MSVC
