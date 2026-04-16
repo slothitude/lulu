@@ -71,10 +71,21 @@ jobs:
             echo "Patched local_file_system.cpp"
           fi
 
-          # 4. buffer_manager.cpp — guard SEH for non-MSVC
-          if [ -f src/storage/buffer_manager/buffer_manager.cpp ]; then
-            sed -i 's/#if defined(_WIN32)/#if defined(_WIN32) \&\& defined(_MSC_VER)/' src/storage/buffer_manager/buffer_manager.cpp
-            echo "Patched buffer_manager.cpp"
+          # 4. buffer_manager.cpp — guard SEH for MinGW (no _set_se_translator)
+          BM=src/storage/buffer_manager/buffer_manager.cpp
+          if [ -f "$BM" ]; then
+            python3 -c "
+          import sys
+          with open('$BM', 'r') as f: c = f.read()
+          # Wrap the SEH block (uses _set_se_translator) with _MSC_VER guard
+          c = c.replace('#if defined(WIN32)\nclass AccessViolation',
+                         '#if defined(WIN32) && defined(_MSC_VER)\nclass AccessViolation')
+          # Also add MinGW fallback for the optimistic read section
+          c = c.replace('#if defined(_WIN32) && !defined(_MSC_VER) && !BM_MALLOC',
+                         '#if defined(_WIN32) && !defined(_MSC_VER) && !BM_MALLOC')
+          with open('$BM', 'w') as f: f.write(c)
+          print('Patched buffer_manager.cpp')
+          "
           fi
 
           # 5. glob.hpp — use getenv instead of _dupenv_s for non-MSVC
@@ -85,7 +96,6 @@ jobs:
 
           # 6. CMakeLists.txt — add ws2_32 for WIN32 linking
           if [ -f src/CMakeLists.txt ]; then
-            # Find the WIN32 if() block that sets RYU_LIBRARIES and append ws2_32
             sed -i '/WIN32/,/endif()/ s/set(RYU_LIBRARIES/set(RYU_LIBRARIES ws2_32/' src/CMakeLists.txt
             echo "Patched src/CMakeLists.txt"
           fi
