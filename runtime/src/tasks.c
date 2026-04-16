@@ -1,4 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
+#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,14 @@ static Task g_tasks[MAX_TASKS];
 static int  g_task_count = 0;
 static char g_tasks_path[512] = {0};
 static int  g_next_id = 1;
+
+/* ===== Thread safety ===== */
+
+static CRITICAL_SECTION g_tasks_lock;
+
+void tasks_init_lock(void) { InitializeCriticalSection(&g_tasks_lock); }
+void tasks_lock(void)      { EnterCriticalSection(&g_tasks_lock); }
+void tasks_unlock(void)    { LeaveCriticalSection(&g_tasks_lock); }
 
 /* ===== Helpers ===== */
 
@@ -157,11 +166,13 @@ Task *tasks_create(const char *prompt, const char *source, long long chat_id, in
 }
 
 /* Priority + cooldown scheduler.
-   - "pending" tasks first (highest priority)
-   - "failed" tasks after cooldown (60s per attempt)
-   - skip "running", "done" */
+   - "pending" tasks first (highest effective priority)
+   - "failed" tasks after cooldown (30s per attempt, capped at 300s)
+   - skip "running", "done"
+   - Priority aging: tasks waiting > 60s get +1 priority */
 Task *tasks_next_runnable(void) {
     Task *best = NULL;
+    int best_eff = -1;
     time_t now = time(NULL);
 
     for (int i = 0; i < g_task_count; i++) {
@@ -171,14 +182,21 @@ Task *tasks_next_runnable(void) {
         if (strcmp(t->status, "running") == 0) continue;
 
         if (strcmp(t->status, "failed") == 0) {
-            /* Cooldown: wait longer for each retry */
+            /* Cooldown: 30s per attempt, capped at 300s */
             int cooldown = 30 * t->attempts;
+            if (cooldown > 300) cooldown = 300;
             if (t->max_attempts > 0 && t->attempts >= t->max_attempts) continue;
             if (difftime(now, t->updated_at) < cooldown) continue;
         }
 
-        if (!best || t->priority > best->priority) {
+        /* Priority aging: boost tasks waiting > 60s */
+        int eff = t->priority;
+        if (difftime(now, t->created_at) > 60.0 && t->priority < 10)
+            eff = t->priority + 1;
+
+        if (!best || eff > best_eff) {
             best = t;
+            best_eff = eff;
         }
     }
 

@@ -1,12 +1,22 @@
 #define _CRT_SECURE_NO_WARNINGS
+#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "session.h"
 
 /* Linked list of sessions */
 static ChatSession *g_sessions = NULL;
+
+/* ===== Thread safety ===== */
+
+static CRITICAL_SECTION g_session_lock;
+
+void session_init_lock(void) { InitializeCriticalSection(&g_session_lock); }
+void session_lock(void)      { EnterCriticalSection(&g_session_lock); }
+void session_unlock(void)    { LeaveCriticalSection(&g_session_lock); }
 
 /* Helper: add message to session's ring buffer */
 static void session_add_message(ChatSession *s, const char *role, const char *content) {
@@ -28,7 +38,10 @@ ChatSession *session_get_or_create(long long chat_id) {
     /* Search existing */
     ChatSession *s = g_sessions;
     while (s) {
-        if (s->chat_id == chat_id) return s;
+        if (s->chat_id == chat_id) {
+            s->last_active = time(NULL);
+            return s;
+        }
         s = s->next;
     }
 
@@ -36,6 +49,7 @@ ChatSession *session_get_or_create(long long chat_id) {
     s = (ChatSession *)calloc(1, sizeof(ChatSession));
     if (!s) return NULL;
     s->chat_id = chat_id;
+    s->last_active = time(NULL);
     s->next = g_sessions;
     g_sessions = s;
     return s;
@@ -74,4 +88,21 @@ int session_count(void) {
     ChatSession *s = g_sessions;
     while (s) { count++; s = s->next; }
     return count;
+}
+
+void session_prune(time_t max_age) {
+    time_t now = time(NULL);
+    ChatSession **pp = &g_sessions;
+    while (*pp) {
+        ChatSession *s = *pp;
+        if (difftime(now, s->last_active) > max_age) {
+            *pp = s->next;
+            for (int i = 0; i < s->hist_count; i++) {
+                free(s->history[i].content);
+            }
+            free(s);
+        } else {
+            pp = &s->next;
+        }
+    }
 }

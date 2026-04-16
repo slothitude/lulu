@@ -13,8 +13,10 @@ static AgentEvent g_event_queue[CH_EVENT_QUEUE];
 static int g_event_head = 0;
 static int g_event_tail = 0;
 static int g_event_count = 0;
+static CRITICAL_SECTION g_queue_lock;
 
 static void enqueue_event(const AgentEvent *ev) {
+    EnterCriticalSection(&g_queue_lock);
     if (g_event_count >= CH_EVENT_QUEUE) {
         /* Drop oldest */
         g_event_head = (g_event_head + 1) % CH_EVENT_QUEUE;
@@ -23,13 +25,19 @@ static void enqueue_event(const AgentEvent *ev) {
     g_event_queue[g_event_tail] = *ev;
     g_event_tail = (g_event_tail + 1) % CH_EVENT_QUEUE;
     g_event_count++;
+    LeaveCriticalSection(&g_queue_lock);
 }
 
 static int dequeue_event(AgentEvent *out) {
-    if (g_event_count == 0) return 0;
+    EnterCriticalSection(&g_queue_lock);
+    if (g_event_count == 0) {
+        LeaveCriticalSection(&g_queue_lock);
+        return 0;
+    }
     *out = g_event_queue[g_event_head];
     g_event_head = (g_event_head + 1) % CH_EVENT_QUEUE;
     g_event_count--;
+    LeaveCriticalSection(&g_queue_lock);
     return 1;
 }
 
@@ -68,6 +76,8 @@ static long long g_tg_chat_id = 0;
 /* ===== Public API ===== */
 
 void channels_init(const char *tg_bot_token, long long tg_chat_id) {
+    InitializeCriticalSection(&g_queue_lock);
+
     /* CLI is always available */
     cli_init();
 

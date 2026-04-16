@@ -51,7 +51,14 @@ static time_t g_start_time;
 
 /* Limits */
 #define MAX_TOOL_STEPS     8
+#define MAX_TOOL_RESULT_CHARS 4096
 #define CHAT_INPUT_MAX     4096
+
+/* Threading */
+static CRITICAL_SECTION g_state_lock;
+static CONDITION_VARIABLE g_task_ready;    /* signal: new task available */
+static CONDITION_VARIABLE g_task_done;     /* signal: task completed */
+static volatile int g_worker_busy = 0;
 
 /* ========================= Ctrl+C Handler ========================= */
 
@@ -113,6 +120,13 @@ static char *execute_tool(const char *tool_name, cJSON *args, const char *worksp
     if (result) {
         char *rjson = cJSON_PrintUnformatted(result);
         cJSON_Delete(result);
+
+        /* Truncate large tool results to prevent context explosion */
+        if (rjson && strlen(rjson) > MAX_TOOL_RESULT_CHARS) {
+            rjson[MAX_TOOL_RESULT_CHARS - 16] = 0;
+            strcat(rjson, "...[TRUNCATED]");
+        }
+
         char *msg;
         asprintf(&msg, "Tool '%s' succeeded: %s", tool_name, rjson ? rjson : "ok");
         free(rjson);
@@ -224,19 +238,24 @@ static void execute_task(Task *t, const char *workspace) {
     if (!t) return;
 
     printf("[TASK] Executing %s: %s (attempt %d)\n", t->id, t->prompt, t->attempts + 1);
+
+    tasks_lock();
     strncpy(t->status, "running", TASK_STATUS_MAX - 1);
     t->attempts++;
     t->updated_at = time(NULL);
     tasks_save();
+    tasks_unlock();
 
     /* Create temporary session for this task */
     long long task_chat_id = t->chat_id ? t->chat_id : 0;
+    session_lock();
     ChatSession *session = session_get_or_create(task_chat_id + 1000000); /* offset to avoid collision */
     char sys_prompt[4096];
     build_system_prompt(sys_prompt, sizeof(sys_prompt));
 
     /* Clear and rebuild session for this task */
     session_clear(task_chat_id + 1000000);
+    session_unlock();
 
     /* Re-add system prompt */
     if (session->hist_count >= SESSION_HISTORY) {
@@ -283,31 +302,40 @@ static void execute_task(Task *t, const char *workspace) {
         }
 
         if (is_done) {
+            tasks_lock();
             tasks_update(t, "done", result);
             tasks_append_state(t, result);
+            tasks_unlock();
             printf("[TASK] %s completed: %.100s\n", t->id, result);
             channels_reply(t->chat_id, result);
         } else {
+            tasks_lock();
             tasks_append_state(t, result);
             tasks_update(t, "pending", ""); /* Re-queue for next attempt */
+            tasks_unlock();
         }
         free(result);
     } else {
         char err[128];
         snprintf(err, sizeof(err), "LLM call failed (attempt %d/%d)", t->attempts, t->max_attempts);
+        tasks_lock();
         tasks_append_state(t, err);
         if (t->attempts >= t->max_attempts) {
             tasks_update(t, "failed", err);
+            tasks_unlock();
             printf("[TASK] %s failed: %s\n", t->id, err);
             channels_reply(t->chat_id, err);
         } else {
             strncpy(t->status, "pending", TASK_STATUS_MAX - 1);
             tasks_save();
+            tasks_unlock();
         }
     }
 
     /* Clean up task session */
+    session_lock();
     session_clear(task_chat_id + 1000000);
+    session_unlock();
 
     /* Log task execution */
     state_log_stage(g_log_path, t->attempts, "task",
@@ -354,10 +382,16 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
         time_t uptime = difftime(time(NULL), g_start_time);
         int h = (int)(uptime / 3600);
         int m = (int)((uptime % 3600) / 60);
+        tasks_lock();
+        int total = tasks_count(NULL);
+        int pending = tasks_count("pending");
+        int done = tasks_count("done");
+        tasks_unlock();
         snprintf(status, sizeof(status),
-            "Uptime: %dh %dm | Steps: %d | Messages: %lld | Tasks: %d (%d pending, %d done)",
+            "Uptime: %dh %dm | Steps: %d | Messages: %lld | Tasks: %d (%d pending, %d done) | Worker: %s",
             h, m, g_mem.step_count, g_mem.total_messages,
-            tasks_count(NULL), tasks_count("pending"), tasks_count("done"));
+            total, pending, done,
+            g_worker_busy ? "BUSY" : "IDLE");
         channels_reply(ev->chat_id, status);
         return;
     }
@@ -382,7 +416,9 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
 
     if (strcmp(text, "/tasks") == 0) {
         char buf[2048];
+        tasks_lock();
         tasks_list(buf, sizeof(buf));
+        tasks_unlock();
         channels_reply(ev->chat_id, buf);
         return;
     }
@@ -393,13 +429,16 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
             channels_reply(ev->chat_id, "Usage: /goal <description>");
             return;
         }
+        tasks_lock();
         Task *t = tasks_create(goal_text, ev->type, ev->chat_id, 10);
+        tasks_unlock();
         if (t) {
             char msg[256];
             snprintf(msg, sizeof(msg), "Task created: %s — I'll work on it.", t->id);
             channels_reply(ev->chat_id, msg);
 
             /* Add to goals in memory */
+            EnterCriticalSection(&g_state_lock);
             if (g_mem.goals_count < MAX_GOALS) {
                 Goal *g = &g_mem.goals[g_mem.goals_count++];
                 snprintf(g->id, sizeof(g->id), "goal_%d", g_mem.goals_count);
@@ -407,6 +446,10 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
                 strncpy(g->status, "active", sizeof(g->status) - 1);
                 g->created_at = time(NULL);
             }
+            LeaveCriticalSection(&g_state_lock);
+
+            /* Wake worker thread */
+            WakeConditionVariable(&g_task_ready);
         } else {
             channels_reply(ev->chat_id, "Failed to create task (queue full).");
         }
@@ -421,6 +464,7 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
 /* ========================= Message Handler ========================= */
 
 static void handle_message(const AgentEvent *ev, const char *workspace) {
+    session_lock();
     ChatSession *session = session_get_or_create(ev->chat_id);
 
     /* Initialize system prompt if new session */
@@ -451,8 +495,11 @@ static void handle_message(const AgentEvent *ev, const char *workspace) {
     strncpy(m->role, "user", sizeof(m->role) - 1);
     m->content = _strdup(ev->text);
     session->hist_count++;
+    session_unlock();
 
+    EnterCriticalSection(&g_state_lock);
     g_mem.total_messages++;
+    LeaveCriticalSection(&g_state_lock);
 
     /* Chat with tools */
     char *reply = chat_with_tools(session, workspace);
@@ -787,6 +834,58 @@ static int core_init(const char *tools_dir) {
     return 1;
 }
 
+/* ========================= Worker Thread ========================= */
+
+static DWORD WINAPI worker_thread_func(LPVOID param) {
+    time_t last_prune = 0;
+    int save_tick = 0;
+
+    while (g_running) {
+        /* Agent think — state-driven reasoning */
+        agent_think();
+
+        /* Get next runnable task (under lock) */
+        tasks_lock();
+        Task *t = tasks_next_runnable();
+        tasks_unlock();
+
+        if (t) {
+            g_worker_busy = 1;
+            execute_task(t, g_workspace_path);
+            g_worker_busy = 0;
+            /* Check for more tasks immediately */
+            continue;
+        }
+
+        /* Periodic save (~every 50 idle iterations) */
+        if (++save_tick >= 50) {
+            EnterCriticalSection(&g_state_lock);
+            memory_save(&g_mem, g_memory_path);
+            LeaveCriticalSection(&g_state_lock);
+            tasks_lock();
+            tasks_save();
+            tasks_unlock();
+            save_tick = 0;
+        }
+
+        /* Prune old sessions every 60s */
+        time_t now = time(NULL);
+        if (difftime(now, last_prune) > 60) {
+            session_lock();
+            session_prune(3600); /* 1 hour */
+            session_unlock();
+            last_prune = now;
+        }
+
+        /* Wait for new task or timeout */
+        EnterCriticalSection(&g_state_lock);
+        SleepConditionVariableCS(&g_task_ready, &g_state_lock, 2000);
+        LeaveCriticalSection(&g_state_lock);
+    }
+
+    return 0;
+}
+
 /* ========================= Core Agent Loop ========================= */
 
 static void run_agent(void) {
@@ -808,6 +907,13 @@ static void run_agent(void) {
         tg_subscriber_init(tg_chat_id);
     }
 
+    /* Initialize thread safety */
+    InitializeCriticalSection(&g_state_lock);
+    InitializeConditionVariable(&g_task_ready);
+    InitializeConditionVariable(&g_task_done);
+    tasks_init_lock();
+    session_init_lock();
+
     /* Load tasks */
     tasks_load(g_tasks_path);
     int resumed = tasks_count("pending") + tasks_count("failed");
@@ -826,11 +932,16 @@ static void run_agent(void) {
     SetConsoleCtrlHandler(agent_ctrl_handler, TRUE);
     g_start_time = time(NULL);
 
-    /* ===== Main Loop ===== */
+    /* Create worker thread */
+    HANDLE worker = CreateThread(NULL, 0, worker_thread_func, NULL, 0, NULL);
+    if (!worker) {
+        fprintf(stderr, "[FATAL] Could not create worker thread\n");
+        return;
+    }
+
+    /* ===== I/O Loop (main thread) ===== */
     while (g_running) {
         int processed = 0;
-
-        /* 1. Process incoming events (capped to prevent heartbeat starvation) */
         while (channels_poll(0.1) && processed < MAX_EVENTS_PER_TICK) {
             AgentEvent ev;
             if (!channels_next(&ev)) break;
@@ -842,28 +953,18 @@ static void run_agent(void) {
 
             processed++;
         }
-
-        /* 2. Agent think — state-driven reasoning */
-        agent_think();
-
-        /* 3. Heartbeat: execute one pending/runnable task */
-        Task *t = tasks_next_runnable();
-        if (t) {
-            execute_task(t, g_workspace_path);
-        }
-
-        /* 4. Periodic save */
-        static int save_tick = 0;
-        if (++save_tick >= 10) {
-            memory_save(&g_mem, g_memory_path);
-            tasks_save();
-            save_tick = 0;
-        }
     }
 
     /* ===== Shutdown ===== */
+    /* Signal worker to exit */
+    WakeConditionVariable(&g_task_ready);
+    WaitForSingleObject(worker, 5000);
+    CloseHandle(worker);
+
     printf("\n[SHUTDOWN] Saving state...\n");
+    tasks_lock();
     tasks_save();
+    tasks_unlock();
     memory_save(&g_mem, g_memory_path);
     llm_cache_save();
     channels_shutdown();
@@ -873,6 +974,7 @@ static void run_agent(void) {
     event_bus_shutdown();
     tools_cleanup();
 
+    DeleteCriticalSection(&g_state_lock);
     printf("[SHUTDOWN] Done.\n");
 }
 

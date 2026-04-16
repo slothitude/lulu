@@ -11,6 +11,7 @@ typedef struct ChatSession {
     long long chat_id;
     ChatMessage history[SESSION_HISTORY];
     int hist_count;
+    time_t last_active;          /* updated on get_or_create */
     struct ChatSession *next;
 } ChatSession;
 
@@ -25,3 +26,11 @@ void session_free_all(void);
 
 /* Get count of active sessions. */
 int  session_count(void);
+
+/* Prune sessions inactive for > max_age seconds. */
+void session_prune(time_t max_age);
+
+/* Thread safety — initialize before multi-threaded access */
+void session_init_lock(void);
+void session_lock(void);
+void session_unlock(void);

@@ -1,6 +1,8 @@
-# Lulu v3 — Always-On Autonomous Agent
+# Lulu v3.1 — Always-On Autonomous Agent
 
 Local autonomous agent with DLL-loaded tools, persistent tasks, and simultaneous CLI + Telegram channels. Written in C11.
+
+**v3.1** adds a two-thread architecture, thread-safe shared state, priority aging, session TTL, and tool result truncation.
 
 ## Quick Start
 
@@ -23,24 +25,28 @@ run.bat --replay --last 20 --stage actor
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────┐
-│             Agent Core Loop                  │
-│                                              │
-│  while (running) {                           │
-│    events = poll_channels()    ← CLI + TG    │
-│    for event in events:                      │
-│      route(event) → chat / command           │
-│    agent_think() → state-driven reasoning    │
-│    task = next_runnable() → execute_task()   │
-│    persist()                                 │
-│  }                                           │
-│                                              │
-│  Channels:  CLI (stdin) + Telegram (TDLib)   │
-│  Tasks:     tasks.json (survives restart)    │
-│  Sessions:  per-chat history (dynamic)       │
-│  Tools:     DLL system (runtime-loaded)      │
-│  LLM:       OpenAI-compatible (WinHTTP)      │
-└──────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│              Two-Thread Architecture                 │
+│                                                      │
+│  Main Thread (I/O)          Worker Thread            │
+│  ┌──────────────┐           ┌──────────────┐        │
+│  │ poll channels │           │ agent_think() │        │
+│  │  CLI + TG     │           │ next_runnable │        │
+│  │ route events  │           │ execute_task() │       │
+│  │ → command     │           │ periodic save  │       │
+│  │ → chat+tools  │           │ session prune  │       │
+│  └──────────────┘           │ Sleep on CV    │       │
+│                              └──────────────┘        │
+│                                                      │
+│  Thread safety: CRITICAL_SECTION on tasks, sessions,  │
+│  channel queue. CONDITION_VARIABLE for task wake.    │
+│                                                      │
+│  Channels:  CLI (stdin) + Telegram (TDLib)           │
+│  Tasks:     tasks.json (survives restart)            │
+│  Sessions:  per-chat history (linked list, dynamic)  │
+│  Tools:     DLL system (runtime-loaded)              │
+│  LLM:       OpenAI-compatible (WinHTTP)              │
+└─────────────────────────────────────────────────────┘
 ```
 
 ### execute_task() — Structured Autonomy
@@ -57,8 +63,16 @@ Each task carries rolling `state`, `last_error`, and `plan` fields so retries ar
 
 `tasks_next_runnable()` picks the highest-priority eligible task:
 - Pending tasks run immediately
-- Failed tasks retry after cooldown (30s × attempts)
+- Failed tasks retry after cooldown (30s × attempts, capped at 300s max)
 - Permanently failed (max_attempts reached) are skipped
+- Priority aging: tasks waiting > 60s get +1 effective priority (cap 10)
+
+### Robustness Features
+
+- **Session TTL**: idle sessions pruned after 1 hour (`session_prune`)
+- **Tool result truncation**: results > 4KB truncated to prevent context explosion
+- **Worker status**: `/status` shows `Worker: BUSY` or `Worker: IDLE`
+- **Thread safety**: `CRITICAL_SECTION` guards on tasks, sessions, and channel queue; `CONDITION_VARIABLE` wakes worker on new tasks
 
 ## Directory Structure
 
