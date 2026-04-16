@@ -18,6 +18,7 @@
 #include "subscribers/sdl3_debugger.h"
 #include "subscribers/tg_subscriber.h"
 #include "channel.h"
+#include "telegram.h"
 #include "tasks.h"
 #include "session.h"
 #include "decision_engine.h"
@@ -1502,10 +1503,56 @@ static void run_agent(void) {
             AgentEvent ev;
             if (!channels_next(&ev)) break;
 
-            if (strcmp(ev.action, "command") == 0)
+            if (strcmp(ev.action, "command") == 0) {
                 handle_command(&ev, g_workspace_path);
-            else
+            }
+            else if (strcmp(ev.action, "callback") == 0) {
+                /* Telegram inline keyboard callback */
+                tg_answer_callback_query(ev.query_id, "OK");
+                fprintf(stderr, "[TG] Callback: %s (chat=%lld, msg=%lld)\n",
+                        ev.callback_data, ev.chat_id, ev.msg_id);
+
+                if (strcmp(ev.callback_data, "retry_last") == 0) {
+                    channels_reply(ev.chat_id, "Retrying last task...");
+                    /* Re-inject as a message to trigger worker */
+                    AgentEvent retry = {0};
+                    strncpy(retry.type, ev.type, sizeof(retry.type) - 1);
+                    retry.chat_id = ev.chat_id;
+                    strncpy(retry.action, "command", sizeof(retry.action) - 1);
+                    strncpy(retry.text, "/tasks", sizeof(retry.text) - 1);
+                    handle_command(&retry, g_workspace_path);
+                }
+                else if (strcmp(ev.callback_data, "ignore") == 0) {
+                    channels_reply(ev.chat_id, "Acknowledged.");
+                }
+                else if (strcmp(ev.callback_data, "new_goal") == 0) {
+                    channels_reply(ev.chat_id, "Send me a new goal!");
+                }
+                else if (strcmp(ev.callback_data, "status") == 0) {
+                    AgentEvent status_ev = ev;
+                    strncpy(status_ev.text, "/status", sizeof(status_ev.text) - 1);
+                    strncpy(status_ev.action, "command", sizeof(status_ev.action) - 1);
+                    handle_command(&status_ev, g_workspace_path);
+                }
+                else {
+                    /* Unknown callback — forward as message to agent */
+                    char fwd[512];
+                    snprintf(fwd, sizeof(fwd), "[button:%s]", ev.callback_data);
+                    strncpy((char*)ev.text, fwd, sizeof(ev.text) - 1);
+                    ((char*)ev.text)[sizeof(ev.text) - 1] = 0;
+                    handle_message(&ev, g_workspace_path);
+                }
+            }
+            else if (strcmp(ev.type, "sdl3") == 0) {
+                /* SDL3 widget click event */
+                printf("[SDL3] Click on node %d: %s\n", ev.sdl3_node_id, ev.text);
+                fprintf(stderr, "[SDL3] Click on node %d: %s\n", ev.sdl3_node_id, ev.text);
+                /* Forward to agent as a message */
                 handle_message(&ev, g_workspace_path);
+            }
+            else {
+                handle_message(&ev, g_workspace_path);
+            }
 
             processed++;
         }

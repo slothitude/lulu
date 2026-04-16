@@ -82,6 +82,16 @@ static int cli_read_line(char *buf, size_t size) {
 static int g_tg_enabled = 0;
 static long long g_tg_chat_id = 0;
 
+/* ===== SDL3 poll function pointer (set by tools.c) ===== */
+
+typedef int (*sdl3_poll_fn)(int *node_id, char *callback, size_t cb_size,
+                             char *signal, size_t sig_size, float *mx, float *my);
+static sdl3_poll_fn g_sdl3_poll = NULL;
+
+void channels_set_sdl3_poll(void *fn) {
+    g_sdl3_poll = (sdl3_poll_fn)fn;
+}
+
 /* ===== Public API ===== */
 
 void channels_init(const char *tg_bot_token, long long tg_chat_id) {
@@ -153,6 +163,40 @@ int channels_poll(double timeout) {
         Sleep((DWORD)(timeout * 1000));
     }
 
+    /* 3. Telegram callback queries */
+    if (g_tg_enabled) {
+        long long cb_chat, cb_msg, cb_qid;
+        char cb_data[256];
+        while (tg_get_next_callback(&cb_chat, &cb_msg, &cb_qid, cb_data, sizeof(cb_data))) {
+            /* Filter to configured chat if set */
+            if (g_tg_chat_id != 0 && cb_chat != g_tg_chat_id) continue;
+
+            AgentEvent ev = {0};
+            strncpy(ev.type, "telegram", sizeof(ev.type) - 1);
+            strncpy(ev.action, "callback", sizeof(ev.action) - 1);
+            ev.chat_id = cb_chat;
+            ev.msg_id = cb_msg;
+            ev.query_id = cb_qid;
+            strncpy(ev.callback_data, cb_data, sizeof(ev.callback_data) - 1);
+            enqueue_event(&ev);
+            got_event = 1;
+        }
+    }
+
+    /* 4. SDL3 window events */
+    if (g_sdl3_poll) {
+        int nid; char cb[128], sig[64]; float mx, my;
+        while (g_sdl3_poll(&nid, cb, sizeof(cb), sig, sizeof(sig), &mx, &my)) {
+            AgentEvent ev = {0};
+            strncpy(ev.type, "sdl3", sizeof(ev.type) - 1);
+            strncpy(ev.action, "click", sizeof(ev.action) - 1);
+            ev.sdl3_node_id = nid;
+            snprintf(ev.text, sizeof(ev.text), "callback=%s signal=%s", cb, sig);
+            enqueue_event(&ev);
+            got_event = 1;
+        }
+    }
+
     return got_event || g_event_count > 0;
 }
 
@@ -166,6 +210,22 @@ void channels_reply(long long chat_id, const char *text) {
         fflush(stdout);
     } else if (g_tg_enabled) {
         tg_send_message(chat_id, text);
+    }
+}
+
+void channels_reply_inline(long long chat_id, const char *text, const char *buttons) {
+    if (chat_id == 0) {
+        /* CLI: just print text, no inline keyboard concept */
+        printf("%s\n", text);
+        fflush(stdout);
+    } else if (g_tg_enabled) {
+        tg_send_message_inline(chat_id, text, buttons);
+    }
+}
+
+void channels_edit_message(long long chat_id, long long msg_id, const char *text) {
+    if (g_tg_enabled && chat_id != 0) {
+        tg_edit_message(chat_id, msg_id, text);
     }
 }
 

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "tools.h"
+#include "channel.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -11,6 +12,10 @@
 
 static LoadedTool g_tools[MAX_LOADED_TOOLS];
 static int g_tool_count = 0;
+
+/* SDL3 window poll function pointer (resolved from sdl3_render DLL) */
+typedef int (*sdl3_poll_fn)(int*, char*, size_t, char*, size_t, float*, float*);
+static sdl3_poll_fn g_sdl3_poll = NULL;
 
 /* ========================= Argument Normalization ========================= */
 
@@ -106,6 +111,16 @@ int tools_load_all(const char *dir) {
             strncpy(t->description, info->description, sizeof(t->description) - 1);
         g_tool_count++;
 
+        /* Try to resolve sdl3_window_poll for interactive window support */
+        if (strcmp(info->name, "sdl3_render") == 0) {
+            sdl3_poll_fn poll = (sdl3_poll_fn)(void *)GetProcAddress(lib, "sdl3_window_poll");
+            if (poll) {
+                g_sdl3_poll = poll;
+                channels_set_sdl3_poll((void*)poll);
+                fprintf(stderr, "[TOOLS] sdl3_window_poll resolved\n");
+            }
+        }
+
         fprintf(stderr, "[TOOLS] Loaded: %s\n", info->name);
     } while (FindNextFileA(hFind, &fd));
 
@@ -155,6 +170,9 @@ char *tools_get_enabled_names(void) {
 
 void tools_cleanup(void) {
 #ifdef _WIN32
+    /* Close SDL3 window before unloading DLL */
+    g_sdl3_poll = NULL;
+    channels_set_sdl3_poll(NULL);
     for (int i = 0; i < g_tool_count; i++) {
         if (g_tools[i].handle) {
             FreeLibrary((HMODULE)g_tools[i].handle);
@@ -163,4 +181,10 @@ void tools_cleanup(void) {
     }
 #endif
     g_tool_count = 0;
+}
+
+int tools_sdl3_poll(int *node_id, char *callback, size_t cb_size,
+                    char *signal, size_t sig_size, float *mx, float *my) {
+    if (!g_sdl3_poll) return 0;
+    return g_sdl3_poll(node_id, callback, cb_size, signal, sig_size, mx, my);
 }

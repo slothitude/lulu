@@ -1185,6 +1185,240 @@ static cJSON *handle_ui_theme_set(cJSON *args, const char *workspace, char **err
     return r;
 }
 
+/* ========================= Interactive Window ========================= */
+
+static SDL_Window   *g_win = NULL;
+static SDL_Renderer *g_win_ren = NULL;
+static volatile int  g_win_running = 0;
+static int g_win_width = 640, g_win_height = 480;
+
+#define SDL_EVT_Q 32
+static struct { int node_id; char callback[128]; char signal[64]; float mx, my; }
+    g_sdl_events[SDL_EVT_Q];
+static volatile LONG g_sdl_ev_head = 0, g_sdl_ev_tail = 0;
+
+/* Hit-test: find deepest visible node at (x,y) that has a registered signal */
+static UiNode *ui_hit_test(UiNode *node, float x, float y) {
+    if (!node || !node->active || !node->visible) return NULL;
+    if (x < node->pos_x || x > node->pos_x + node->size_w) return NULL;
+    if (y < node->pos_y || y > node->pos_y + node->size_h) return NULL;
+
+    /* Check children first (deepest wins) */
+    for (int i = node->child_count - 1; i >= 0; i--) {
+        UiNode *c = ui_find_node(node->children[i]);
+        UiNode *hit = ui_hit_test(c, x, y);
+        if (hit) return hit;
+    }
+    return node;
+}
+
+/* Find registered signal for a node */
+static UiSignal *ui_find_signal_for_node(int node_id) {
+    for (int i = 0; i < g_signal_count; i++) {
+        if (g_signals[i].active && g_signals[i].node_id == node_id)
+            return &g_signals[i];
+    }
+    return NULL;
+}
+
+/* Enqueue an SDL3 click event (thread-safe via Interlocked) */
+static void sdl3_enqueue_event(int node_id, const char *callback,
+                                const char *signal, float mx, float my) {
+    LONG tail = InterlockedExchangeAdd(&g_sdl_ev_tail, 0);
+    LONG next = (tail + 1) % SDL_EVT_Q;
+    if (next == InterlockedExchangeAdd(&g_sdl_ev_head, 0)) return; /* full */
+    g_sdl_events[tail].node_id = node_id;
+    strncpy(g_sdl_events[tail].callback, callback ? callback : "", 127);
+    g_sdl_events[tail].callback[127] = 0;
+    strncpy(g_sdl_events[tail].signal, signal ? signal : "", 63);
+    g_sdl_events[tail].signal[63] = 0;
+    g_sdl_events[tail].mx = mx;
+    g_sdl_events[tail].my = my;
+    InterlockedExchange(&g_sdl_ev_tail, next);
+}
+
+/* Window thread — runs SDL event loop at ~60fps */
+#ifdef _WIN32
+static DWORD WINAPI sdl3_window_thread(LPVOID param) {
+    (void)param;
+    g_win_running = 1;
+    fprintf(stderr, "[SDL3] Window thread started\n");
+
+    while (g_win_running) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_EVENT_QUIT) {
+                g_win_running = 0;
+                break;
+            }
+            if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == 1) {
+                float mx = e.button.x, my = e.button.y;
+                /* Find root nodes */
+                for (int i = 0; i < UI_MAX_NODES; i++) {
+                    if (!g_nodes[i].active || g_nodes[i].parent_id != 0) continue;
+                    UiNode *hit = ui_hit_test(&g_nodes[i], mx, my);
+                    if (hit) {
+                        UiSignal *sig = ui_find_signal_for_node(hit->id);
+                        if (sig) {
+                            sdl3_enqueue_event(hit->id, sig->callback, sig->signal, mx, my);
+                            fprintf(stderr, "[SDL3] Click: node=%d signal=%s cb=%s\n",
+                                    hit->id, sig->signal, sig->callback);
+                        }
+                        break;
+                    }
+                }
+            }
+            if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE) {
+                g_win_running = 0;
+                break;
+            }
+        }
+
+        /* Check if re-render needed */
+        if (g_dirty && g_win_ren) {
+            g_dirty = 0;
+            /* Layout pass */
+            int root_count = 0; UiNode *roots[16];
+            for (int i = 0; i < UI_MAX_NODES && root_count < 16; i++) {
+                if (g_nodes[i].active && g_nodes[i].parent_id == 0)
+                    roots[root_count++] = &g_nodes[i];
+            }
+            float cw = (float)g_win_width, ch = (float)g_win_height;
+            if (root_count == 1) {
+                ui_compute_min_size(roots[0]);
+                ui_compute_layout(roots[0], 0, 0, cw, ch);
+            } else {
+                for (int i = 0; i < root_count; i++) ui_compute_min_size(roots[i]);
+                float total_h = 0;
+                for (int i = 0; i < root_count; i++) total_h += roots[i]->min_h;
+                float scale = total_h > ch ? ch / total_h : 1.0f;
+                float cy = 0;
+                for (int i = 0; i < root_count; i++) {
+                    float rh = roots[i]->min_h * scale;
+                    ui_compute_layout(roots[i], 0, cy, cw, rh);
+                    cy += rh;
+                }
+            }
+            /* Render */
+            SDL_SetRenderDrawColorFloat(g_win_ren, 0.10f, 0.10f, 0.12f, 1.0f);
+            SDL_RenderClear(g_win_ren);
+            for (int i = 0; i < root_count; i++) ui_draw_node(g_win_ren, roots[i]);
+            SDL_RenderPresent(g_win_ren);
+        }
+
+        SDL_Delay(16); /* ~60fps */
+    }
+
+    fprintf(stderr, "[SDL3] Window thread exiting\n");
+    return 0;
+}
+#endif
+
+/* Exported poll function — called from main thread via GetProcAddress */
+TOOL_EXPORT int sdl3_window_poll(int *node_id, char *callback, size_t cb_size,
+                                  char *signal, size_t sig_size,
+                                  float *mx, float *my) {
+    LONG head = InterlockedExchangeAdd(&g_sdl_ev_head, 0);
+    LONG tail = InterlockedExchangeAdd(&g_sdl_ev_tail, 0);
+    if (head == tail) return 0; /* empty */
+
+    *node_id = g_sdl_events[head].node_id;
+    strncpy(callback, g_sdl_events[head].callback, cb_size - 1);
+    callback[cb_size - 1] = 0;
+    strncpy(signal, g_sdl_events[head].signal, sig_size - 1);
+    signal[sig_size - 1] = 0;
+    if (mx) *mx = g_sdl_events[head].mx;
+    if (my) *my = g_sdl_events[head].my;
+
+    LONG next = (head + 1) % SDL_EVT_Q;
+    InterlockedExchange(&g_sdl_ev_head, next);
+    return 1;
+}
+
+/* Action: open interactive window */
+static cJSON *handle_ui_window_open(cJSON *args, const char *workspace, char **error) {
+    (void)workspace;
+    if (g_win) TOOL_ERROR("window already open — close first");
+
+    int width = (int)get_num(args, "width", "w", 640);
+    int height = (int)get_num(args, "height", "h", 480);
+    const char *title = get_str(args, "title", "name");
+    if (!title) title = "Lulu — Interactive";
+
+    g_win_width = width;
+    g_win_height = height;
+
+    int was_init = SDL_WasInit(SDL_INIT_VIDEO);
+    if (!was_init) {
+        if (!SDL_Init(SDL_INIT_VIDEO)) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "SDL3 init error: %s", SDL_GetError());
+            *error = _strdup(buf); return NULL;
+        }
+    }
+
+    if (!SDL_CreateWindowAndRenderer(title, width, height, 0, &g_win, &g_win_ren)) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "SDL3 window error: %s", SDL_GetError());
+        *error = _strdup(buf); return NULL;
+    }
+
+    g_dirty = 1;
+    g_sdl_ev_head = g_sdl_ev_tail = 0;
+    g_win_running = 1;
+
+    /* Spawn window thread */
+#ifdef _WIN32
+    HANDLE thread = CreateThread(NULL, 0, sdl3_window_thread, NULL, 0, NULL);
+    if (!thread) {
+        SDL_DestroyRenderer(g_win_ren);
+        SDL_DestroyWindow(g_win);
+        g_win = NULL; g_win_ren = NULL;
+        TOOL_ERROR("failed to create window thread");
+    }
+    CloseHandle(thread);
+#endif
+
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "status", "opened");
+    cJSON_AddNumberToObject(r, "width", width);
+    cJSON_AddNumberToObject(r, "height", height);
+    return r;
+}
+
+/* Action: close interactive window */
+static cJSON *handle_ui_window_close(cJSON *args, const char *workspace, char **error) {
+    (void)args; (void)workspace; (void)error;
+    if (!g_win) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddStringToObject(r, "status", "no_window");
+        return r;
+    }
+    g_win_running = 0;
+    Sleep(50); /* wait for thread to exit */
+
+    if (g_win_ren) { SDL_DestroyRenderer(g_win_ren); g_win_ren = NULL; }
+    if (g_win) { SDL_DestroyWindow(g_win); g_win = NULL; }
+
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "status", "closed");
+    return r;
+}
+
+/* Action: trigger re-render of live window */
+static cJSON *handle_ui_window_update(cJSON *args, const char *workspace, char **error) {
+    (void)args; (void)workspace; (void)error;
+    if (!g_win) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddStringToObject(r, "status", "no_window");
+        return r;
+    }
+    g_dirty = 1;
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "status", "updated");
+    return r;
+}
+
 /* ========================= Tool entry ========================= */
 
 static cJSON *sdl3_render(cJSON *args, const char *workspace, char **error) {
@@ -1200,6 +1434,9 @@ static cJSON *sdl3_render(cJSON *args, const char *workspace, char **error) {
     if (strcmp(action, "ui_get_tree") == 0)     return handle_ui_get_tree(args, workspace, error);
     if (strcmp(action, "ui_clear") == 0)        return handle_ui_clear(args, workspace, error);
     if (strcmp(action, "ui_theme_set") == 0)    return handle_ui_theme_set(args, workspace, error);
+    if (strcmp(action, "ui_window_open") == 0)  return handle_ui_window_open(args, workspace, error);
+    if (strcmp(action, "ui_window_close") == 0) return handle_ui_window_close(args, workspace, error);
+    if (strcmp(action, "ui_window_update") == 0) return handle_ui_window_update(args, workspace, error);
 
     /* ---- info action ---- */
     if (strcmp(action, "info") == 0 || strcmp(action, "get_info") == 0
@@ -1369,7 +1606,7 @@ static cJSON *sdl3_render(cJSON *args, const char *workspace, char **error) {
         return r;
     }
 
-    TOOL_ERROR("unknown action '%s', expected: render, window, info, ui_create, ui_set_prop, ui_connect, ui_destroy, ui_render_frame, ui_get_tree, ui_clear, ui_theme_set");
+    TOOL_ERROR("unknown action '%s', expected: render, window, info, ui_create, ui_set_prop, ui_connect, ui_destroy, ui_render_frame, ui_get_tree, ui_clear, ui_theme_set, ui_window_open, ui_window_close, ui_window_update");
 }
 
 static ToolInfo info = {

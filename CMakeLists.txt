@@ -42,21 +42,8 @@ target_include_directories(agent PRIVATE
     ${kuzu_SOURCE_DIR}/src/include/main
 )
 
-# Link RyuGraph + system libs
-target_link_libraries(agent PRIVATE
-    ryu_shared
-    winhttp
-    ws2_32
-    psapi
-    iphlpapi
-    bcrypt
-    crypt32
-    userenv
-    ncrypt
-    ssl
-    crypto
-    z
-)
+# Core libs (RyuGraph first)
+target_link_libraries(agent PRIVATE ryu_shared)
 
 # TDLib static libs (if present)
 if(EXISTS "${CMAKE_SOURCE_DIR}/libs")
@@ -66,7 +53,15 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/libs")
         tde2e tdmtproto tddb tdnet tdactor
         tdutils tdsqlite tdtl tdapi
     )
+    target_compile_definitions(agent PRIVATE ENABLE_TELEGRAM TDJSON_STATIC_DEFINE)
 endif()
+
+# System libs (after TDLib since TDLib depends on them)
+target_link_libraries(agent PRIVATE
+    winhttp ws2_32 psapi iphlpapi bcrypt crypt32 userenv ncrypt ssl crypto z
+)
+
+target_compile_definitions(agent PRIVATE ENABLE_SDL3_DEBUG)
 
 # SDL3 (if present)
 target_link_libraries(agent PRIVATE SDL3 SDL3_image)

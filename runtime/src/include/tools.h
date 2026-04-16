@@ -32,3 +32,8 @@ char *tools_get_enabled_names(void);
 
 /* Cleanup: free all loaded DLLs */
 void tools_cleanup(void);
+
+/* Poll SDL3 window events from the sdl3_render DLL.
+    Returns 1 if event available. */
+int tools_sdl3_poll(int *node_id, char *callback, size_t cb_size,
+                    char *signal, size_t sig_size, float *mx, float *my);
