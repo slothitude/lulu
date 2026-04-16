@@ -1,8 +1,11 @@
-# Lulu v4.0 — Graph-Native Autonomous Agent
+<div align="center">
+  <img src="lulu_logo.jpg" alt="Lulu Logo" width="200">
+  <h1>Lulu v4.1 — Graph-Native Autonomous Agent</h1>
+</div>
 
 Local autonomous agent with an embedded property graph database, DLL-loaded tools, persistent tasks, and simultaneous CLI + Telegram channels. Written in C11.
 
-**v4.0** replaces all flat-file storage with an embedded RyuGraph (Kuzu fork) property graph database. Every action, memory, tool use, and decision becomes a permanent traversable node.
+**v4.0** replaced all flat-file storage with an embedded RyuGraph (Kuzu fork) property graph database. Every action, memory, tool use, and decision becomes a permanent traversable node. **v4.1** adds a standalone updater, `/update` command, NSIS installer, and CI/CD release pipeline.
 
 ## Quick Start
 
@@ -107,6 +110,7 @@ bashagent/
 ├── run.bat                     # Build + run entrypoint
 ├── config.json                 # LLM credentials (not committed)
 ├── agent.json                  # Agent behavior config
+├── lulu_logo.jpg               # Logo
 ├── runtime/
 │   ├── src/
 │   │   ├── main.c             # Core loop, message handling, one-shot
@@ -125,13 +129,24 @@ bashagent/
 │   │   ├── cJSON.c            # Vendored JSON parser
 │   │   ├── include/
 │   │   │   ├── agent_db.h     # Graph storage API
+│   │   │   ├── version.h     # Version constants (single source of truth)
 │   │   │   ├── tasks.h        # Task types (DbTask alias)
 │   │   │   └── ...
 │   │   ├── subscribers/       # Event bus subscribers (log, mem, SDL3, TG)
 │   │   └── tools/             # Tool DLL sources
 │   └── tools/                 # Built DLLs
+├── updater/
+│   └── updater.c              # Standalone updater (WinHTTP, GitHub Releases)
+├── installer/
+│   └── lulu.nsi               # NSIS installer script
+├── scripts/
+│   └── package.sh             # Local build + package script
+├── .github/
+│   └── workflows/
+│       └── release.yml        # CI/CD: build + release on tag push
 ├── build/                      # CMake build directory
 │   ├── agent.exe              # Built binary
+│   ├── updater.exe            # Built updater
 │   └── libryu_shared.dll      # RyuGraph shared library
 ├── tools/                     # Runtime-loaded tool DLLs
 ├── workspace/                 # Sandboxed file operations root
@@ -152,6 +167,8 @@ bashagent/
 | `/decide` | Show last decision engine debug info |
 | `/goal <text>` | Create a high-priority autonomous task |
 | `/graph <cypher>` | Run read-only Cypher query on the graph |
+| `/update` | Check GitHub for new version |
+| `/update confirm` | Apply pending update, restart agent |
 
 ## Configuration
 
@@ -275,6 +292,48 @@ TOOL_EXPORT tool_execute_fn tool_get_execute(void) { return my_tool; }
 - SDL3 + SDL3_image (for sdl3_render tool)
 - TDLib (for Telegram integration)
 - WinHTTP (system library)
+
+## Install & Update
+
+### NSIS Installer
+
+Download `lulu-{version}-setup.exe` from [GitHub Releases](https://github.com/slothitude/lulu/releases) and run. The installer:
+- Copies binaries to `Program Files\Lulu\`
+- Creates empty `state/`, `workspace/`, `tg_data/` directories
+- Optionally adds install dir to PATH
+- Optionally installs SDL3 runtime and tool plugins
+- Writes `HKLM\Software\Lulu\InstallDir` registry key (used by updater)
+- Creates Start Menu shortcuts
+
+### Updating
+
+From any channel (CLI or Telegram):
+```
+/update              # Check for new version
+/update confirm      # Apply update + restart
+```
+
+Or run the standalone updater directly:
+```
+updater.exe --check                    # Check GitHub for latest release
+updater.exe --apply --restart          # Download, install, restart agent
+updater.exe --apply --install-dir C:\path  # Custom install location
+```
+
+The updater preserves user data during updates: `config.json`, `state/`, `workspace/`, `tg_data/` are never overwritten.
+
+### Packaging
+
+Build a distributable zip locally:
+```bash
+./scripts/package.sh          # → dist/lulu-{version}-win64.zip
+```
+
+Push a tag to trigger CI/CD:
+```bash
+git tag v4.1.0
+git push origin v4.1.0        # → GitHub Actions builds + creates draft release
+```
 
 ## Security
 
