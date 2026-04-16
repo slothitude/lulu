@@ -54,43 +54,38 @@ jobs:
           cd build/_deps/kuzu-src
 
           # 1. helpers.h — add cstdint
-          if [ -f src/include/c_api/helpers.h ]; then
-            sed -i '1i #include <cstdint>' src/include/c_api/helpers.h
-            echo "Patched helpers.h"
-          fi
+          sed -i '1i #include <cstdint>' src/include/c_api/helpers.h
+          echo "Patched helpers.h"
 
           # 2. helpers.cpp — add cstdint
-          if [ -f src/c_api/helpers.cpp ]; then
-            sed -i '1i #include <cstdint>' src/c_api/helpers.cpp
-            echo "Patched helpers.cpp"
-          fi
+          sed -i '1i #include <cstdint>' src/c_api/helpers.cpp
+          echo "Patched helpers.cpp"
 
           # 3. local_file_system.cpp — add sys/stat.h
-          if [ -f src/common/file_system/local_file_system.cpp ]; then
-            sed -i '1i #include <sys/stat.h>' src/common/file_system/local_file_system.cpp
-            echo "Patched local_file_system.cpp"
-          fi
+          sed -i '1i #include <sys/stat.h>' src/common/file_system/local_file_system.cpp
+          echo "Patched local_file_system.cpp"
 
-          # 4. buffer_manager.cpp — guard SEH for MinGW (no _set_se_translator)
+          # 4. buffer_manager.cpp — guard SEH with _MSC_VER
           BM=src/storage/buffer_manager/buffer_manager.cpp
-          if [ -f "$BM" ]; then
-            # Replace "#if defined(WIN32)" that precedes "class AccessViolation" with _MSC_VER guard
-            # Use awk to do the multi-line-aware replacement
-            awk '/^#if defined\(WIN32\)$/{p=NR} p && NR==p+1 && /class AccessViolation/{gsub(/^#if defined\(WIN32\)$/,"#if defined(WIN32) && defined(_MSC_VER)")} {print}' "$BM" > "$BM.tmp" && mv "$BM.tmp" "$BM"
-            echo "Patched buffer_manager.cpp"
-          fi
+          # Replace "#if defined(WIN32)" (standalone line) that is followed by "class AccessViolation"
+          awk '
+          /^#if defined\(WIN32\)$/ { line=$0; getline; if (/class AccessViolation/) print "#if defined(WIN32) && defined(_MSC_VER)"; else print line; }
+          { print }
+          ' "$BM" > "$BM.tmp" && mv "$BM.tmp" "$BM"
+          echo "Patched buffer_manager.cpp (SEH guard)"
 
-          # 5. glob.hpp — use getenv instead of _dupenv_s for non-MSVC
-          if [ -f third_party/glob/glob/glob.hpp ]; then
-            sed -i 's/_dupenv_s(\&result, \&length, name)/(result = getenv(name), length = result ? strlen(result) : 0, (void)0)/' third_party/glob/glob/glob.hpp
-            echo "Patched glob.hpp"
-          fi
+          # 5. glob.hpp — replace _dupenv_s with getenv for MinGW
+          sed -i 's/_dupenv_s(\&result, \&length, name)/(result = getenv(name), length = result ? strlen(result) : 0, (void)0)/' third_party/glob/glob/glob.hpp
+          echo "Patched glob.hpp"
 
-          # 6. CMakeLists.txt — add ws2_32 for WIN32 linking
-          if [ -f src/CMakeLists.txt ]; then
-            sed -i '/WIN32/,/endif()/ s/set(RYU_LIBRARIES/set(RYU_LIBRARIES ws2_32/' src/CMakeLists.txt
-            echo "Patched src/CMakeLists.txt"
-          fi
+          # 6. CMakeLists.txt — add ws2_32 to RYU_LIBRARIES on WIN32
+          CL=src/CMakeLists.txt
+          # The original has: set(RYU_LIBRARIES ${RYU_LIBRARIES} Threads::Threads) inside if(WIN32)
+          # Add ws2_32 to that line
+          sed -i 's/set(RYU_LIBRARIES ${RYU_LIBRARIES} Threads::Threads)/set(RYU_LIBRARIES ${RYU_LIBRARIES} Threads::Threads ws2_32)/' "$CL"
+          # If no Threads::Threads line, try adding to the base RYU_LIBRARIES line
+          grep -q "ws2_32" "$CL" || sed -i '/if(WIN32)/a\\    set(RYU_LIBRARIES ${RYU_LIBRARIES} ws2_32)' "$CL"
+          echo "Patched src/CMakeLists.txt (ws2_32)"
 
           echo "All patches applied"
 
