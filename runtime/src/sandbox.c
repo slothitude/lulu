@@ -23,6 +23,17 @@ int sandbox_is_path_safe(const char *path, const char *workspace) {
     /* Block empty paths */
     if (path[0] == '\0') return 0;
 
+    /* Block null bytes injected into filenames */
+    for (const char *p = path; *p; p++) {
+        if ((unsigned char)*p < 0x20 && *p != '\t') return 0;
+    }
+
+    /* Block UNC path escape (\\?\, \\server\share) */
+    if (path[0] == '\\' && path[1] == '\\') return 0;
+
+    /* Block long path prefix (\\?\C:\...) */
+    if (strstr(path, "\\\\?\\") != NULL) return 0;
+
     /* Block absolute paths */
     if (path[0] == '/' || path[0] == '\\' ||
         (isalpha((unsigned char)path[0]) && path[1] == ':')) {
@@ -41,6 +52,23 @@ int sandbox_is_path_safe(const char *path, const char *workspace) {
     if (strstr(path, "/proc/") || strstr(path, "\\proc\\")) return 0;
     if (strstr(path, "system32") || strstr(path, "System32")) return 0;
     if (strstr(path, "windows") || strstr(path, "Windows")) return 0;
+
+    /* Block filenames with leading/trailing dots (hidden files on Unix, device names) */
+    {
+        const char *last_sep = strrchr(path, '/');
+        const char *last_sep2 = strrchr(path, '\\');
+        const char *basename = path;
+        if (last_sep && last_sep > basename) basename = last_sep + 1;
+        if (last_sep2 && last_sep2 > basename) basename = last_sep2 + 1;
+        /* Block CON, PRN, AUX, NUL, COM1-9, LPT1-9 (Windows device names) */
+        if (strlen(basename) >= 3) {
+            char upper[4] = { toupper((unsigned char)basename[0]),
+                              toupper((unsigned char)basename[1]),
+                              toupper((unsigned char)basename[2]), 0 };
+            if (strcmp(upper, "CON") == 0 || strcmp(upper, "PRN") == 0 ||
+                strcmp(upper, "AUX") == 0 || strcmp(upper, "NUL") == 0) return 0;
+        }
+    }
 
     return 1;
 }
@@ -80,14 +108,20 @@ char *sandbox_resolve_path(const char *path, const char *workspace) {
         return NULL;
     }
 
-    /* Verify the resolved path still starts with workspace */
+    /* Block UNC or long-path prefix in resolved output */
+    if (resolved[0] == '\\' && resolved[1] == '\\') {
+        free(full);
+        return NULL;
+    }
+
+    /* Verify the resolved path still starts with workspace (case-insensitive on Windows) */
     char resolved_workspace[MAX_PATH];
     if (GetFullPathNameA(workspace, MAX_PATH, resolved_workspace, NULL) == 0) {
         free(full);
         return NULL;
     }
 
-    if (strncmp(resolved, resolved_workspace, strlen(resolved_workspace)) != 0) {
+    if (_strnicmp(resolved, resolved_workspace, strlen(resolved_workspace)) != 0) {
         free(full);
         return NULL;
     }

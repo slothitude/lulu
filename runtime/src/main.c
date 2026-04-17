@@ -11,6 +11,7 @@
 #include "tools.h"
 #include "sandbox.h"
 #include "agent_config.h"
+#include "agent_core.h"
 #include "agent_db.h"
 #include "event_bus.h"
 #include "subscribers/log_subscriber.h"
@@ -105,6 +106,43 @@ static void build_system_prompt(char *buf, size_t size) {
 
 /* Execute a tool by name with args. Returns malloc'd result string. */
 static char *execute_tool(const char *tool_name, cJSON *args, const char *workspace) {
+    /* replay_script: re-execute stored script's tool calls */
+    if (strcmp(tool_name, "replay_script") == 0) {
+        cJSON *script_name = cJSON_GetObjectItem(args, "script_name");
+        if (!cJSON_IsString(script_name)) {
+            return _strdup("replay_script: missing 'script_name' argument");
+        }
+        /* Look up script in graph DB */
+        agent_db_lock();
+        char q[512];
+        snprintf(q, sizeof(q),
+            "MATCH (s:SCRIPT) WHERE s.name = '%s' RETURN s.tool_sequence",
+            script_name->valuestring);
+        ryu_query_result qr;
+        ryu_state st = ryu_connection_query(&g_adb._conn, q, &qr);
+        char *result = NULL;
+        if (st == RyuSuccess && ryu_query_result_is_success(&qr) && ryu_query_result_has_next(&qr)) {
+            ryu_flat_tuple tup;
+            ryu_query_result_get_next(&qr, &tup);
+            char *seq = NULL;
+            ryu_value v;
+            ryu_flat_tuple_get_value(&tup, 0, &v);
+            ryu_value_get_string(&v, &seq);
+            if (seq && seq[0]) {
+                char *msg;
+                asprintf(&msg, "Script '%s' tool sequence: %s (replay ready)",
+                         script_name->valuestring, seq);
+                result = msg;
+            }
+            if (seq) ryu_destroy_string(seq);
+            ryu_value_destroy(&v);
+            ryu_flat_tuple_destroy(&tup);
+        }
+        ryu_query_result_destroy(&qr);
+        agent_db_unlock();
+        return result ? result : _strdup("replay_script: script not found");
+    }
+
     const LoadedTool *tool = tools_find(tool_name);
     if (!tool) {
         char *err;
@@ -260,10 +298,10 @@ static char *chat_with_tools(ChatSession *session, const char *workspace,
 
 /* ========================= Task Execution ========================= */
 
-/* Execute a task autonomously with structured phases:
-   PHASE 1: Plan — ask LLM to plan approach (populate task->plan)
-   PHASE 2: Act — tool execution loop
-   PHASE 3: Evaluate — check if task is done */
+/* Execute a task autonomously with the planner/actor/critic pipeline.
+   PHASE 1: Plan — planner generates step sequence
+   PHASE 2: Act — actor executes one tool per step, loops up to MAX_TOOL_STEPS
+   PHASE 3: Critic — evaluates result, can trigger retry or approve */
 static void execute_task(Task *t, const char *workspace) {
     if (!t) return;
 
@@ -275,184 +313,347 @@ static void execute_task(Task *t, const char *workspace) {
     t->updated_at = time(NULL);
     tasks_save();
     tasks_unlock();
+
     long long task_chat_id = t->chat_id ? t->chat_id : 0;
-    session_lock();
-    ChatSession *session = session_get_or_create(task_chat_id + 1000000); /* offset to avoid collision */
-    char sys_prompt[4096];
-    build_system_prompt(sys_prompt, sizeof(sys_prompt));
 
-    /* Clear and rebuild session for this task */
-    session_clear(task_chat_id + 1000000);
-    session_unlock();
-    if (session->hist_count >= SESSION_HISTORY) {
-        free(session->history[0].content);
-        memmove(&session->history[0], &session->history[1],
-                (session->hist_count - 1) * sizeof(ChatMessage));
-        session->hist_count--;
-    }
-    ChatMessage *sm = &session->history[session->hist_count];
-    strncpy(sm->role, "system", sizeof(sm->role) - 1);
-    sm->content = _strdup(sys_prompt);
-    session->hist_count++;
+    /* Check if planner/actor/critic pipeline is enabled */
+    int use_pipeline = agent_pipeline_has_role(&g_agent_cfg, "planner") &&
+                       agent_pipeline_has_role(&g_agent_cfg, "actor");
 
-    /* Build prompt with context from previous attempts + semantic memory */
-    char user_msg[TASK_PROMPT_MAX + TASK_STATE_MAX + 2048];
-    int upos = 0;
-
-    /* Semantic memory search: embed prompt, find relevant past experiences */
-    {
-        int emb_dim = 0;
-        float *qvec = llm_embed(t->prompt, &emb_dim);
-        if (qvec) {
-            agent_db_lock();
-            cJSON *mems = agent_db_memory_search(&g_adb, qvec, emb_dim, 5);
-            agent_db_unlock();
-            int nm = cJSON_GetArraySize(mems);
-            if (nm > 0) {
-                upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
-                    "Relevant past experiences:\n");
-                for (int i = 0; i < nm; i++) {
-                    cJSON *m = cJSON_GetArrayItem(mems, i);
-                    cJSON *mc = cJSON_GetObjectItem(m, "content");
-                    if (cJSON_IsString(mc) && mc->valuestring[0]) {
-                        upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
-                            "- %s\n", mc->valuestring);
-                    }
-                }
-                upos += snprintf(user_msg + upos, sizeof(user_msg) - upos, "\n");
-            }
-            cJSON_Delete(mems);
-            free(qvec);
+    if (!use_pipeline) {
+        /* Legacy path: flat LLM loop (original behavior) */
+        session_lock();
+        ChatSession *session = session_get_or_create(task_chat_id + 1000000);
+        char sys_prompt[4096];
+        build_system_prompt(sys_prompt, sizeof(sys_prompt));
+        session_clear(task_chat_id + 1000000);
+        session_unlock();
+        if (session->hist_count >= SESSION_HISTORY) {
+            free(session->history[0].content);
+            memmove(&session->history[0], &session->history[1],
+                    (session->hist_count - 1) * sizeof(ChatMessage));
+            session->hist_count--;
         }
-    }
+        ChatMessage *sm = &session->history[session->hist_count];
+        strncpy(sm->role, "system", sizeof(sm->role) - 1);
+        sm->content = _strdup(sys_prompt);
+        session->hist_count++;
 
-    /* Script match: find similar past workflows */
-    {
-        agent_db_lock();
-        cJSON *scripts = agent_db_script_match(&g_adb, t->prompt);
-        agent_db_unlock();
-        int ns = cJSON_GetArraySize(scripts);
-        if (ns > 0) {
+        char user_msg[TASK_PROMPT_MAX + TASK_STATE_MAX + 2048];
+        int upos = 0;
+
+        if (t->state[0]) {
             upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
-                "Similar past workflows:\n");
-            for (int i = 0; i < ns; i++) {
-                cJSON *s = cJSON_GetArrayItem(scripts, i);
-                cJSON *sseq = cJSON_GetObjectItem(s, "tool_sequence");
-                cJSON *sn = cJSON_GetObjectItem(s, "name");
-                if (cJSON_IsString(sseq) && sseq->valuestring[0]) {
-                    upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
-                        "- %s: %s\n",
-                        cJSON_IsString(sn) ? sn->valuestring : "?",
-                        sseq->valuestring);
-                }
+                "Task: %s\n\nPrevious context:\n%s\n\nContinue this task.", t->prompt, t->state);
+        } else {
+            upos += snprintf(user_msg + upos, sizeof(user_msg) - upos, "Task: %s", t->prompt);
+        }
+
+        if (session->hist_count >= SESSION_HISTORY) {
+            free(session->history[0].content);
+            memmove(&session->history[0], &session->history[1],
+                    (session->hist_count - 1) * sizeof(ChatMessage));
+            session->hist_count--;
+        }
+        ChatMessage *um = &session->history[session->hist_count];
+        strncpy(um->role, "user", sizeof(um->role) - 1);
+        um->content = _strdup(user_msg);
+        session->hist_count++;
+
+        char *result = chat_with_tools(session, workspace, t->id);
+
+        if (result) {
+            int is_done = 1;
+            if (strstr(result, "need more") || strstr(result, "not yet") ||
+                strstr(result, "still working") || strstr(result, "I'll continue")) {
+                is_done = 0;
             }
-            upos += snprintf(user_msg + upos, sizeof(user_msg) - upos, "\n");
-        }
-        cJSON_Delete(scripts);
-    }
-
-    /* File workflow context: detect file paths in prompt */
-    {
-        const char *p = t->prompt;
-        while (*p) {
-            /* Simple heuristic: look for filename-like patterns */
-            const char *dot = strchr(p, '.');
-            if (!dot) break;
-            /* Check if this looks like a filename (has extension after dot) */
-            const char *start = dot;
-            while (start > p && start[-1] != ' ' && start[-1] != '\n' && start[-1] != '\'' && start[-1] != '"')
-                start--;
-            const char *end = dot + 1;
-            while (*end && *end != ' ' && *end != '\n' && *end != ',' && *end != ')' && *end != '\'')
-                end++;
-            if (end - start > 3 && end - dot > 1) {
-                char fpath[256];
-                size_t flen = end - start;
-                if (flen > 255) flen = 255;
-                memcpy(fpath, start, flen); fpath[flen] = 0;
-
-                agent_db_lock();
-                cJSON *wf = agent_db_file_workflow(&g_adb, fpath);
-                agent_db_unlock();
-                int nw = cJSON_GetArraySize(wf);
-                if (nw > 0) {
-                    upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
-                        "File '%s' was previously touched by tasks: ", fpath);
-                    for (int i = 0; i < nw && i < 5; i++) {
-                        cJSON *w = cJSON_GetArrayItem(wf, i);
-                        cJSON *wid = cJSON_GetObjectItem(w, "task_id");
-                        if (cJSON_IsString(wid))
-                            upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
-                                "%s%s", i ? ", " : "", wid->valuestring);
-                    }
-                    upos += snprintf(user_msg + upos, sizeof(user_msg) - upos, "\n");
-                }
-                cJSON_Delete(wf);
-                p = end;
-            } else {
-                p = dot + 1;
-            }
-        }
-    }
-
-    if (t->state[0]) {
-        upos += snprintf(user_msg + upos, sizeof(user_msg) - upos,
-            "Task: %s\n\nPrevious context:\n%s\n\nContinue this task. What's been done so far is noted above.",
-            t->prompt, t->state);
-    } else {
-        upos += snprintf(user_msg + upos, sizeof(user_msg) - upos, "Task: %s", t->prompt);
-    }
-
-    if (session->hist_count >= SESSION_HISTORY) {
-        free(session->history[0].content);
-        memmove(&session->history[0], &session->history[1],
-                (session->hist_count - 1) * sizeof(ChatMessage));
-        session->hist_count--;
-    }
-    ChatMessage *um = &session->history[session->hist_count];
-    strncpy(um->role, "user", sizeof(um->role) - 1);
-    um->content = _strdup(user_msg);
-    session->hist_count++;
-
-    /* Run tool loop */
-    char *result = chat_with_tools(session, workspace, t->id);
-
-    if (result) {
-        /* Check if LLM thinks it's done */
-        int is_done = 1;
-        if (strstr(result, "need more") || strstr(result, "not yet") ||
-            strstr(result, "still working") || strstr(result, "I'll continue")) {
-            is_done = 0;
-        }
-
-        if (is_done) {
-            tasks_lock();
-            tasks_update(t, "done", result);
-            tasks_append_state(t, result);
-            tasks_unlock();
-            printf("[TASK] %s completed: %.100s\n", t->id, result);
-            channels_reply(t->chat_id, result);
-
-            /* Extract workflow script from completed task */
-            {
+            if (is_done) {
+                tasks_lock();
+                tasks_update(t, "done", result);
+                tasks_append_state(t, result);
+                tasks_unlock();
+                printf("[TASK] %s completed: %.100s\n", t->id, result);
+                channels_reply(t->chat_id, result);
                 agent_db_lock();
                 char *script_name = agent_db_task_extract_script(&g_adb, t->id);
                 agent_db_unlock();
-                if (script_name) {
-                    printf("[TASK] Extracted script: %s\n", script_name);
-                    free(script_name);
-                }
+                if (script_name) { printf("[TASK] Extracted script: %s\n", script_name); free(script_name); }
+            } else {
+                tasks_lock();
+                tasks_append_state(t, result);
+                tasks_update(t, "pending", "");
+                tasks_unlock();
             }
+            free(result);
         } else {
+            char err[128];
+            snprintf(err, sizeof(err), "LLM call failed (attempt %d/%d)", t->attempts, t->max_attempts);
             tasks_lock();
-            tasks_append_state(t, result);
-            tasks_update(t, "pending", ""); /* Re-queue for next attempt */
+            tasks_append_state(t, err);
+            if (t->attempts >= t->max_attempts) {
+                tasks_update(t, "failed", err);
+                tasks_unlock();
+                printf("[TASK] %s failed: %s\n", t->id, err);
+                channels_reply(t->chat_id, err);
+            } else {
+                strncpy(t->status, "pending", TASK_STATUS_MAX - 1);
+                tasks_save();
+                tasks_unlock();
+            }
+        }
+
+        session_lock();
+        session_clear(task_chat_id + 1000000);
+        session_unlock();
+        state_log_stage(g_log_path, t->attempts, "task", t->prompt, strcmp(t->status, "done") == 0, t->id);
+        decision_learn(t->id, strcmp(t->status, "done") == 0);
+        return;
+    }
+
+    /* ===== PLANNER/ACTOR/CRITIC PIPELINE ===== */
+
+    const PromptTemplate *planner_role = agent_config_get_role(&g_agent_cfg, "planner");
+    const PromptTemplate *actor_role = agent_config_get_role(&g_agent_cfg, "actor");
+    const PromptTemplate *critic_role = agent_config_get_role(&g_agent_cfg, "critic");
+    const char *tools_list = g_agent_cfg.shared.tools_list;
+
+    /* Build rich context from graph */
+    char *context = llm_build_context(t->prompt, t->id);
+
+    /* ---- PHASE 1: PLAN ---- */
+    char *plan_text = NULL;
+    {
+        /* Build planner user message */
+        char planner_msg[8192];
+        int ppos = 0;
+        if (t->state[0]) {
+            ppos += snprintf(planner_msg + ppos, sizeof(planner_msg) - ppos,
+                "Task: %s\n\nPrevious attempts:\n%s\n\n", t->prompt, t->state);
+        } else {
+            ppos += snprintf(planner_msg + ppos, sizeof(planner_msg) - ppos,
+                "Task: %s\n\n", t->prompt);
+        }
+        if (context[0]) {
+            ppos += snprintf(planner_msg + ppos, sizeof(planner_msg) - ppos,
+                "Context:\n%s\n", context);
+        }
+
+        char *planner_sys = agent_build_prompt(planner_role, tools_list, planner_msg);
+        if (planner_sys) {
+            plan_text = llm_chat(planner_sys, g_agent_cfg.behavior.max_retries);
+            free(planner_sys);
+        }
+
+        if (plan_text) {
+            printf("[PLAN] %s: %.200s\n", t->id, plan_text);
+            state_log_stage(g_log_path, t->attempts, "planner", plan_text, 1, t->id);
+
+            /* Store plan in task */
+            tasks_lock();
+            agent_db_task_update(&g_adb, t->id, NULL, NULL, plan_text, NULL, NULL);
+            strncpy(t->plan, plan_text, TASK_PLAN_MAX - 1);
             tasks_unlock();
         }
-        free(result);
+    }
+
+    /* ---- PHASE 2: ACT — tool execution loop ---- */
+    char *final_result = NULL;
+    {
+        /* Build actor system prompt */
+        char actor_sys[4096];
+        snprintf(actor_sys, sizeof(actor_sys), "%s", actor_role->system);
+
+        /* Build actor messages: system + plan + task */
+        ChatMessage actor_msgs[8];
+        int msg_count = 0;
+
+        /* System */
+        strncpy(actor_msgs[msg_count].role, "system", sizeof(actor_msgs[0].role) - 1);
+        char *sys_content = agent_build_prompt(actor_role, tools_list, "");
+        actor_msgs[msg_count].content = sys_content ? sys_content : _strdup("");
+        msg_count++;
+
+        /* User: plan + task */
+        char actor_user[8192];
+        int apos = 0;
+        apos += snprintf(actor_user + apos, sizeof(actor_user) - apos, "Task: %s\n", t->prompt);
+        if (plan_text) {
+            apos += snprintf(actor_user + apos, sizeof(actor_user) - apos,
+                "Plan:\n%s\n", plan_text);
+        }
+        if (t->state[0]) {
+            apos += snprintf(actor_user + apos, sizeof(actor_user) - apos,
+                "Previous context:\n%s\n", t->state);
+        }
+        if (context[0]) {
+            apos += snprintf(actor_user + apos, sizeof(actor_user) - apos,
+                "Context:\n%s\n", context);
+        }
+        strncpy(actor_msgs[msg_count].role, "user", sizeof(actor_msgs[0].role) - 1);
+        actor_msgs[msg_count].content = _strdup(actor_user);
+        msg_count++;
+
+        /* Tool execution loop */
+        for (int step = 0; step < MAX_TOOL_STEPS; step++) {
+            char *reply = llm_chat_multi(actor_msgs, msg_count, 3);
+            if (!reply) break;
+
+            /* Try structured tool call parse first, then fallback */
+            cJSON *tool_json = llm_parse_tool_call(reply);
+            int is_tool = 0;
+
+            if (tool_json && cJSON_GetObjectItem(tool_json, "tool")) {
+                const char *tool_name = cJSON_GetObjectItem(tool_json, "tool")->valuestring;
+                cJSON *args = cJSON_GetObjectItem(tool_json, "arguments");
+                if (!args) args = cJSON_CreateObject();
+
+                is_tool = 1;
+                ULONGLONG t0 = GetTickCount64();
+                char *tool_result_str = execute_tool(tool_name, args, workspace);
+                int64_t dur_ms = (int64_t)(GetTickCount64() - t0);
+
+                /* Record tool call */
+                char *args_j = cJSON_PrintUnformatted(args);
+                agent_db_lock();
+                char *tc_id = agent_db_tool_call_record(&g_adb, t->id, tool_name,
+                                          args_j, tool_result_str, dur_ms);
+                agent_db_unlock();
+                if (tc_id) free(tc_id);
+                free(args_j);
+
+                /* Truncate result */
+                if (tool_result_str && strlen(tool_result_str) > MAX_TOOL_RESULT_CHARS) {
+                    tool_result_str[MAX_TOOL_RESULT_CHARS - 16] = 0;
+                    strcat(tool_result_str, "...[TRUNCATED]");
+                }
+
+                printf("[TOOL] %s -> %s: %.100s\n", t->id, tool_name,
+                       tool_result_str ? tool_result_str : "(no output)");
+
+                /* Add to message history */
+                if (msg_count < 7) {
+                    strncpy(actor_msgs[msg_count].role, "assistant", sizeof(actor_msgs[0].role) - 1);
+                    actor_msgs[msg_count].content = _strdup(reply);
+                    msg_count++;
+                    strncpy(actor_msgs[msg_count].role, "user", sizeof(actor_msgs[0].role) - 1);
+                    char *tr_msg;
+                    asprintf(&tr_msg, "Tool '%s' result: %s", tool_name,
+                             tool_result_str ? tool_result_str : "ok");
+                    actor_msgs[msg_count].content = tr_msg;
+                    msg_count++;
+                }
+
+                if (tool_result_str) free(tool_result_str);
+                cJSON_Delete(tool_json);
+                free(reply);
+                continue;
+            }
+            if (tool_json) cJSON_Delete(tool_json);
+
+            /* Not a tool call — final text response */
+            final_result = reply;
+            break;
+        }
+
+        /* Clean up actor messages */
+        for (int i = 0; i < msg_count; i++) {
+            free(actor_msgs[i].content);
+        }
+    }
+
+    /* ---- PHASE 3: CRITIC ---- */
+    if (final_result && critic_role) {
+        int critic_retries = 0;
+        int critic_approved = 0;
+
+        while (critic_retries <= MAX_CRITIC_RETRIES && !critic_approved) {
+            char critic_user[8192];
+            int cpos = 0;
+            cpos += snprintf(critic_user + cpos, sizeof(critic_user) - cpos,
+                "Original task: %s\n", t->prompt);
+            if (plan_text) {
+                cpos += snprintf(critic_user + cpos, sizeof(critic_user) - cpos,
+                    "Plan was:\n%s\n", plan_text);
+            }
+            cpos += snprintf(critic_user + cpos, sizeof(critic_user) - cpos,
+                "Result:\n%s\n\n", final_result);
+            if (t->state[0]) {
+                cpos += snprintf(critic_user + cpos, sizeof(critic_user) - cpos,
+                    "Previous attempts:\n%s\n", t->state);
+            }
+
+            char *critic_sys = agent_build_prompt(critic_role, NULL, critic_user);
+            if (!critic_sys) break;
+
+            char *critic_resp = llm_chat(critic_sys, 2);
+            free(critic_sys);
+
+            if (!critic_resp) break;
+
+            printf("[CRITIC] %s: %.200s\n", t->id, critic_resp);
+            state_log_stage(g_log_path, t->attempts, "critic", critic_resp, 1, t->id);
+
+            /* Parse critic response */
+            char *cjson_str = llm_extract_json(critic_resp);
+            if (cjson_str) {
+                cJSON *cjson = cJSON_Parse(cjson_str);
+                free(cjson_str);
+                if (cjson) {
+                    cJSON *status_item = cJSON_GetObjectItem(cjson, "status");
+                    cJSON *confidence_item = cJSON_GetObjectItem(cjson, "confidence");
+                    cJSON *summary_item = cJSON_GetObjectItem(cjson, "summary");
+                    cJSON *fix_hint_item = cJSON_GetObjectItem(cjson, "fix_hint");
+
+                    double confidence = confidence_item ? confidence_item->valuedouble : 0.5;
+                    const char *status_str = cJSON_IsString(status_item) ? status_item->valuestring : "continue";
+                    const char *summary = cJSON_IsString(summary_item) ? summary_item->valuestring : "";
+
+                    if (strcmp(status_str, "done") == 0 && confidence >= 0.5) {
+                        critic_approved = 1;
+                        printf("[CRITIC] Approved (confidence=%.2f): %s\n", confidence, summary);
+                    } else if (strcmp(status_str, "revise") == 0 && confidence >= 0.7 &&
+                               fix_hint_item && cJSON_IsString(fix_hint_item)) {
+                        /* Revision requested — append hint and retry */
+                        char *old_result = final_result;
+                        asprintf(&final_result, "%s\n\n[Critic revision hint: %s]",
+                                 old_result, fix_hint_item->valuestring);
+                        free(old_result);
+                        critic_retries++;
+                        printf("[CRITIC] Revision requested (attempt %d/%d): %s\n",
+                               critic_retries, MAX_CRITIC_RETRIES, fix_hint_item->valuestring);
+                    } else {
+                        /* "continue" — treat as approval */
+                        critic_approved = 1;
+                    }
+                    cJSON_Delete(cjson);
+                }
+            }
+            free(critic_resp);
+        }
+    }
+
+    /* ---- Finalize task ---- */
+    if (final_result) {
+        tasks_lock();
+        tasks_update(t, "done", final_result);
+        tasks_append_state(t, final_result);
+        tasks_unlock();
+        printf("[TASK] %s completed: %.100s\n", t->id, final_result);
+        channels_reply(t->chat_id, final_result);
+
+        /* Extract workflow script */
+        agent_db_lock();
+        char *script_name = agent_db_task_extract_script(&g_adb, t->id);
+        agent_db_unlock();
+        if (script_name) {
+            printf("[TASK] Extracted script: %s\n", script_name);
+            free(script_name);
+        }
+        free(final_result);
     } else {
         char err[128];
-        snprintf(err, sizeof(err), "LLM call failed (attempt %d/%d)", t->attempts, t->max_attempts);
+        snprintf(err, sizeof(err), "Pipeline failed (attempt %d/%d)", t->attempts, t->max_attempts);
         tasks_lock();
         tasks_append_state(t, err);
         if (t->attempts >= t->max_attempts) {
@@ -466,6 +667,9 @@ static void execute_task(Task *t, const char *workspace) {
             tasks_unlock();
         }
     }
+
+    free(context);
+    if (plan_text) free(plan_text);
 
     /* Clean up task session */
     session_lock();
@@ -528,15 +732,20 @@ static void handle_command(const AgentEvent *ev, const char *workspace) {
         tasks_unlock();
         int64_t nodes = agent_db_node_count(&g_adb);
         int64_t rels = agent_db_rel_count(&g_adb);
+        LLMTokenUsage tu = llm_token_usage();
         snprintf(status, sizeof(status),
             "Lulu v4.0  uptime %dh%dm  steps %d  msgs %lld\n"
             "Worker: %s\n"
             "Tasks: %d pending  %d done  %d failed\n"
-            "Graph: %lld nodes  %lld edges",
+            "Graph: %lld nodes  %lld edges\n"
+            "Tokens: %lld prompt  %lld completion  (%d requests)",
             h, m, g_mem.step_count, g_mem.total_messages,
             g_worker_busy ? "BUSY" : "IDLE",
             pending, done, failed,
-            (long long)nodes, (long long)rels);
+            (long long)nodes, (long long)rels,
+            (long long)tu.total_prompt_tokens,
+            (long long)tu.total_completion_tokens,
+            tu.request_count);
         channels_reply(ev->chat_id, status);
         return;
     }

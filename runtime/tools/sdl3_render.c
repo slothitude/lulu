@@ -217,6 +217,7 @@ typedef enum {
     UI_W_BUTTON, UI_W_CHECKBOX, UI_W_PROGRESSBAR, UI_W_OPTIONBUTTON,
     UI_W_SPINBOX,
     UI_W_PANEL, UI_W_PANELCONTAINER, UI_W_SCROLL, UI_W_TABCONTAINER,
+    UI_W_TEXTINPUT,
     UI_W_COUNT
 } UiWidgetType;
 
@@ -246,6 +247,7 @@ typedef struct {
     int grid_columns, grid_hsep, grid_vsep;
     int current_tab;
     int h_scroll_mode, v_scroll_mode; float scroll_x, scroll_y;
+    int flags;  /* bit 0 = keyboard focused */
     StyleBoxFlat style;
 } UiNode;
 
@@ -332,6 +334,7 @@ static UiWidgetType parse_widget_type(const char *name) {
         {"OptionButton",UI_W_OPTIONBUTTON},{"SpinBox",UI_W_SPINBOX},
         {"Panel",UI_W_PANEL},{"PanelContainer",UI_W_PANELCONTAINER},
         {"ScrollContainer",UI_W_SCROLL},{"TabContainer",UI_W_TABCONTAINER},
+        {"TextInput",UI_W_TEXTINPUT},
         {NULL,UI_W_NONE}
     };
     for (int i = 0; types[i].n; i++)
@@ -350,6 +353,7 @@ static const char *widget_type_name(UiWidgetType t) {
     case UI_W_OPTIONBUTTON: return "OptionButton"; case UI_W_SPINBOX: return "SpinBox";
     case UI_W_PANEL: return "Panel";          case UI_W_PANELCONTAINER: return "PanelContainer";
     case UI_W_SCROLL: return "ScrollContainer"; case UI_W_TABCONTAINER: return "TabContainer";
+    case UI_W_TEXTINPUT: return "TextInput";
     default: return "Unknown";
     }
 }
@@ -388,6 +392,11 @@ static void ui_apply_default_style(UiNode *node) {
     case UI_W_TABCONTAINER:
         node->style.bg_color     = (SDL_FColor){0.12f,0.12f,0.15f,1.0f};
         node->style.border_color = (SDL_FColor){0.25f,0.25f,0.30f,1.0f}; break;
+    case UI_W_TEXTINPUT:
+        node->style.bg_color     = (SDL_FColor){0.15f,0.15f,0.20f,1.0f};
+        node->style.border_color = (SDL_FColor){0.40f,0.40f,0.50f,1.0f};
+        node->style.border_width = 2; node->style.corner_radius = 3;
+        node->style.padding = 6; break;
     default: break;
     }
 }
@@ -571,6 +580,8 @@ static void ui_compute_min_size(UiNode *node) {
             th += c->min_h;
         }
         node->min_w = tw; node->min_h = th; return;
+    case UI_W_TEXTINPUT:
+        node->min_w = 200; node->min_h = 32; return;
     case UI_W_SCROLL:
         for (i = 0; i < node->child_count; i++)
             ui_compute_min_size(ui_find_node(node->children[i]));
@@ -689,6 +700,9 @@ static void ui_compute_layout(UiNode *node, float x, float y, float w, float h) 
         }
         break;
     }
+    case UI_W_TEXTINPUT:
+        /* TextInput layout is just its assigned rect, no children */
+        break;
     case UI_W_SCROLL:
         for (i = 0; i < node->child_count; i++) {
             UiNode *c = ui_find_node(node->children[i]); if (!c) continue;
@@ -946,6 +960,41 @@ static void ui_draw_node(SDL_Renderer *renderer, UiNode *node) {
         SDL_SetRenderClipRect(renderer, NULL);
         return;
     }
+    case UI_W_TEXTINPUT: {
+        /* Draw text input background */
+        set_color(renderer, node->style.bg_color);
+        draw_fill_rect(renderer, node->pos_x, node->pos_y, node->size_w, node->size_h);
+        if (node->style.border_width > 0) {
+            set_color(renderer, node->style.border_color);
+            draw_rounded_rect(renderer, node->pos_x, node->pos_y, node->size_w, node->size_h,
+                           (float)node->style.corner_radius, 0);
+        }
+        /* Draw text or placeholder */
+        int pad = node->style.padding;
+        if (node->text[0]) {
+            set_color(renderer, text_col);
+            SDL_RenderDebugText(renderer, node->pos_x + pad, node->pos_y + (node->size_h - 14) / 2,
+                               node->text);
+        } else {
+            /* Show placeholder if set via btn_text */
+            if (node->btn_text[0]) {
+                set_color(renderer, dim_text);
+                SDL_RenderDebugText(renderer, node->pos_x + pad, node->pos_y + (node->size_h - 14) / 2,
+                                   node->btn_text);
+            }
+        }
+        /* Blinking cursor if focused */
+        if (node->flags & 1) { /* bit 0 = focused */
+            Uint32 now = SDL_GetTicks();
+            if ((now / 500) % 2 == 0) {
+                set_color(renderer, text_col);
+                float cx = node->pos_x + pad +
+                    (float)SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE * (float)strlen(node->text);
+                SDL_RenderDebugText(renderer, cx, node->pos_y + (node->size_h - 14) / 2, "|");
+            }
+        }
+        return;
+    }
     default: break;
     }
     /* Default: draw children for layout containers with no visual */
@@ -1195,6 +1244,7 @@ static SDL_Window   *g_win = NULL;
 static SDL_Renderer *g_win_ren = NULL;
 static volatile int  g_win_running = 0;
 static int g_win_width = 640, g_win_height = 480;
+static int g_focused_node = -1;  /* keyboard focus tracking */
 
 #define SDL_EVT_Q 32
 static struct { int node_id; char callback[128]; char signal[64]; float mx, my; }
@@ -1262,6 +1312,10 @@ static DWORD WINAPI sdl3_window_thread(LPVOID param) {
                     if (!g_nodes[i].active || g_nodes[i].parent_id != 0) continue;
                     UiNode *hit = ui_hit_test(&g_nodes[i], mx, my);
                     if (hit) {
+                        /* Set keyboard focus on this node */
+                        g_focused_node = hit->id;
+                        hit->flags |= 1;
+                        g_dirty = 1;
                         UiSignal *sig = ui_find_signal_for_node(hit->id);
                         if (sig) {
                             sdl3_enqueue_event(hit->id, sig->callback, sig->signal, mx, my);
@@ -1275,6 +1329,88 @@ static DWORD WINAPI sdl3_window_thread(LPVOID param) {
             if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE) {
                 g_win_running = 0;
                 break;
+            }
+            /* Window resize: update g_win_width/height */
+            if (e.type == SDL_EVENT_WINDOW_RESIZED) {
+                g_win_width = (int)e.window.data1;
+                g_win_height = (int)e.window.data2;
+                g_dirty = 1;
+            }
+            /* Keyboard navigation */
+            if (e.type == SDL_EVENT_KEY_DOWN) {
+                /* Tab/Shift+Tab: cycle focus */
+                if (e.key.key == SDLK_TAB) {
+                    int start = g_focused_node;
+                    int dir = (e.key.mod & SDL_KMOD_SHIFT) ? -1 : 1;
+                    int next = start;
+                    do {
+                        next += dir;
+                        if (next < 0) next = UI_MAX_NODES - 1;
+                        if (next >= UI_MAX_NODES) next = 0;
+                        if (g_nodes[next].active &&
+                            (g_nodes[next].type == UI_W_BUTTON ||
+                             g_nodes[next].type == UI_W_CHECKBOX ||
+                             g_nodes[next].type == UI_W_TEXTINPUT ||
+                             g_nodes[next].type == UI_W_SPINBOX ||
+                             g_nodes[next].type == UI_W_OPTIONBUTTON)) {
+                            /* Clear old focus */
+                            if (g_focused_node >= 0 && g_focused_node < UI_MAX_NODES)
+                                g_nodes[g_focused_node].flags &= ~1;
+                            g_focused_node = next;
+                            g_nodes[next].flags |= 1;  /* set focused bit */
+                            g_dirty = 1;
+                            break;
+                        }
+                    } while (next != start);
+                }
+                /* Enter on Button: trigger click */
+                if (e.key.key == SDLK_RETURN && g_focused_node >= 0) {
+                    UiNode *fn = &g_nodes[g_focused_node];
+                    if (fn->active && fn->type == UI_W_BUTTON) {
+                        UiSignal *sig = ui_find_signal_for_node(fn->id);
+                        if (sig) {
+                            sdl3_enqueue_event(fn->id, sig->callback, sig->signal, 0, 0);
+                        }
+                    }
+                    /* Enter on TextInput: submit signal */
+                    if (fn->active && fn->type == UI_W_TEXTINPUT) {
+                        UiSignal *sig = ui_find_signal_for_node(fn->id);
+                        if (sig) {
+                            sdl3_enqueue_event(fn->id, sig->callback, "text_submitted", 0, 0);
+                        }
+                    }
+                }
+                /* Space on CheckBox: toggle */
+                if (e.key.key == SDLK_SPACE && g_focused_node >= 0) {
+                    UiNode *fn = &g_nodes[g_focused_node];
+                    if (fn->active && fn->type == UI_W_CHECKBOX) {
+                        fn->checked = !fn->checked;
+                        g_dirty = 1;
+                    }
+                }
+                /* Text input for TextInput widget */
+                if (g_focused_node >= 0 && g_nodes[g_focused_node].active &&
+                    g_nodes[g_focused_node].type == UI_W_TEXTINPUT) {
+                    UiNode *fn = &g_nodes[g_focused_node];
+                    if (e.key.key == SDLK_BACKSPACE && fn->text[0]) {
+                        fn->text[strlen(fn->text) - 1] = 0;
+                        g_dirty = 1;
+                    } else if (e.key.key >= SDLK_SPACE && e.key.key < 127 &&
+                               strlen(fn->text) < sizeof(fn->text) - 2) {
+                        /* Printable character */
+                        size_t len = strlen(fn->text);
+                        fn->text[len] = (char)e.key.key;
+                        fn->text[len + 1] = 0;
+                        g_dirty = 1;
+                    }
+                }
+            }
+            /* Click sets focus */
+            if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == 1) {
+                /* Clear old focus */
+                if (g_focused_node >= 0 && g_focused_node < UI_MAX_NODES)
+                    g_nodes[g_focused_node].flags &= ~1;
+                /* Focus will be set below by hit test */
             }
         }
 
@@ -1361,7 +1497,7 @@ static cJSON *handle_ui_window_open(cJSON *args, const char *workspace, char **e
         }
     }
 
-    if (!SDL_CreateWindowAndRenderer(title, width, height, 0, &g_win, &g_win_ren)) {
+    if (!SDL_CreateWindowAndRenderer(title, width, height, SDL_WINDOW_RESIZABLE, &g_win, &g_win_ren)) {
         char buf[256];
         snprintf(buf, sizeof(buf), "SDL3 window error: %s", SDL_GetError());
         *error = _strdup(buf); return NULL;
@@ -1411,11 +1547,19 @@ static cJSON *handle_ui_window_close(cJSON *args, const char *workspace, char **
 
 /* Action: trigger re-render of live window */
 static cJSON *handle_ui_window_update(cJSON *args, const char *workspace, char **error) {
-    (void)args; (void)workspace; (void)error;
+    (void)workspace; (void)error;
     if (!g_win) {
         cJSON *r = cJSON_CreateObject();
         cJSON_AddStringToObject(r, "status", "no_window");
         return r;
+    }
+    /* Handle resize via props */
+    int new_w = (int)get_num(args, "width", "w", -1);
+    int new_h = (int)get_num(args, "height", "h", -1);
+    if (new_w > 0 && new_h > 0) {
+        SDL_SetWindowSize(g_win, new_w, new_h);
+        g_win_width = new_w;
+        g_win_height = new_h;
     }
     g_dirty = 1;
     cJSON *r = cJSON_CreateObject();

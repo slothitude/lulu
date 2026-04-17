@@ -160,3 +160,11 @@ int agent_pipeline_has_role(const AgentConfig *ac, const char *role) {
     }
     return 0;
 }
+
+const PromptTemplate *agent_config_get_role(const AgentConfig *ac, const char *role) {
+    if (!ac || !role) return NULL;
+    if (strcmp(role, "planner") == 0) return &ac->planner;
+    if (strcmp(role, "actor") == 0)   return &ac->actor;
+    if (strcmp(role, "critic") == 0)  return &ac->critic;
+    return NULL;
+}

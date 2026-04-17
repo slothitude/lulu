@@ -18,6 +18,46 @@
 
 static AgentDB *g_adb_ptr = NULL;
 
+/* ========================= HNSW-lite Index (Phase 9) ========================= */
+
+#define HNSW_M 16       /* max edges per node */
+
+typedef struct {
+    char id[64];
+    float *vec;
+    int dim;
+    int neighbors[HNSW_M];
+    int n_neighbors;
+} HNSWNode;
+
+static HNSWNode *g_hnsw_nodes = NULL;
+static int g_hnsw_count = 0;
+static int g_hnsw_cap = 0;
+static int g_hnsw_valid = 0;  /* 0 = needs rebuild */
+
+static float cosine_sim_hnsw(const float *a, const float *b, int dim) {
+    double dot = 0, na = 0, nb = 0;
+    for (int i = 0; i < dim; i++) {
+        dot += (double)a[i] * b[i];
+        na += (double)a[i] * a[i];
+        nb += (double)b[i] * b[i];
+    }
+    double denom = sqrt(na) * sqrt(nb);
+    return (denom > 0) ? (float)(dot / denom) : 0.0f;
+}
+
+static void hnsw_free(void) {
+    if (!g_hnsw_nodes) return;
+    for (int i = 0; i < g_hnsw_count; i++) {
+        free(g_hnsw_nodes[i].vec);
+    }
+    free(g_hnsw_nodes);
+    g_hnsw_nodes = NULL;
+    g_hnsw_count = 0;
+    g_hnsw_cap = 0;
+    g_hnsw_valid = 0;
+}
+
 void agent_db_init_lock(void) { /* lock initialized in agent_db_open */ }
 void agent_db_lock(void)   { if (g_adb_ptr) EnterCriticalSection(&g_adb_ptr->_lock); }
 void agent_db_unlock(void) { if (g_adb_ptr) LeaveCriticalSection(&g_adb_ptr->_lock); }
@@ -650,6 +690,67 @@ cJSON *agent_db_memory_search(AgentDB *adb, const float *vec, int dim, int k) {
     cJSON *arr = cJSON_CreateArray();
     if (k <= 0) k = 5;
 
+    /* Phase 9: Use HNSW index if available and valid */
+    if (g_hnsw_valid && g_hnsw_count > 0 && vec && dim > 0) {
+        /* Find best entry point by comparing to a sample of nodes */
+        typedef struct { int idx; float score; } ScoreEntry;
+        ScoreEntry *scores = (ScoreEntry *)malloc(g_hnsw_count * sizeof(ScoreEntry));
+        int nscores = 0;
+
+        for (int i = 0; i < g_hnsw_count; i++) {
+            if (g_hnsw_nodes[i].dim != dim) continue;
+            scores[nscores].idx = i;
+            scores[nscores].score = cosine_sim_hnsw(vec, g_hnsw_nodes[i].vec, dim);
+            nscores++;
+        }
+
+        /* Sort by score descending */
+        for (int a = 0; a < nscores - 1; a++) {
+            int best = a;
+            for (int b = a + 1; b < nscores; b++) {
+                if (scores[b].score > scores[best].score) best = b;
+            }
+            if (best != a) { ScoreEntry tmp = scores[a]; scores[a] = scores[best]; scores[best] = tmp; }
+        }
+
+        /* Return top k — need to fetch content from graph */
+        int nk = nscores < k ? nscores : k;
+        for (int i = 0; i < nk; i++) {
+            HNSWNode *node = &g_hnsw_nodes[scores[i].idx];
+
+            /* Fetch content from graph */
+            char fq[512];
+            snprintf(fq, sizeof(fq),
+                "MATCH (m:MEMORY {id:'%s'}) RETURN m.category, m.key, m.content",
+                node->id);
+            ryu_query_result fr;
+            if (ryu_connection_query(&adb->_conn, fq, &fr) == RyuSuccess &&
+                ryu_query_result_is_success(&fr) && ryu_query_result_has_next(&fr)) {
+                ryu_flat_tuple tup;
+                ryu_query_result_get_next(&fr, &tup);
+                char *mcat = dup_col(&tup, 0);
+                char *mkey = dup_col(&tup, 1);
+                char *mcont = dup_col(&tup, 2);
+
+                cJSON *item = cJSON_CreateObject();
+                cJSON_AddStringToObject(item, "id", node->id);
+                cJSON_AddStringToObject(item, "category", mcat ? mcat : "");
+                cJSON_AddStringToObject(item, "key", mkey ? mkey : "");
+                cJSON_AddStringToObject(item, "content", mcont ? mcont : "");
+                cJSON_AddNumberToObject(item, "score", scores[i].score);
+                cJSON_AddItemToArray(arr, item);
+
+                free(mcat); free(mkey); free(mcont);
+                ryu_flat_tuple_destroy(&tup);
+            }
+            ryu_query_result_destroy(&fr);
+        }
+        free(scores);
+        DB_UNGUARD(adb);
+        return arr;
+    }
+
+    /* Fallback: original full-scan path */
     if (vec && dim > 0) {
         /* Vector path: fetch all MEMORY with non-empty embedding, compute cosine sim */
         const char *q = "MATCH (m:MEMORY) WHERE m.embedding <> '' AND m.embedding IS NOT NULL "
@@ -1470,4 +1571,228 @@ int agent_db_migrate_cache_json(AgentDB *adb, const char *path) {
     cJSON_Delete(root);
     printf("[DB] Migrated %d/%d cache entries\n", imported, n);
     return imported;
+}
+
+/* ========================= Phase 9: HNSW-lite Index (build/validate) ========================= */
+
+void agent_db_memory_invalidate_index(void) {
+    g_hnsw_valid = 0;
+}
+
+int agent_db_memory_build_index(AgentDB *adb) {
+    DB_GUARD(adb);
+    hnsw_free();
+
+    /* Fetch all MEMORY nodes with embeddings */
+    const char *q = "MATCH (m:MEMORY) WHERE m.embedding <> '' AND m.embedding IS NOT NULL "
+                    "RETURN m.id, m.embedding";
+    ryu_query_result result;
+    if (ryu_connection_query(&adb->_conn, q, &result) != RyuSuccess ||
+        !ryu_query_result_is_success(&result)) {
+        ryu_query_result_destroy(&result);
+        DB_UNGUARD(adb);
+        return 0;
+    }
+
+    /* Collect all nodes */
+    g_hnsw_cap = 256;
+    g_hnsw_nodes = (HNSWNode *)malloc(g_hnsw_cap * sizeof(HNSWNode));
+    g_hnsw_count = 0;
+    int common_dim = 0;
+
+    while (ryu_query_result_has_next(&result)) {
+        ryu_flat_tuple tup;
+        ryu_query_result_get_next(&result, &tup);
+        char *mid = dup_col(&tup, 0);
+        char *memb = dup_col(&tup, 1);
+
+        if (mid && memb && memb[0]) {
+            cJSON *earr = cJSON_Parse(memb);
+            if (cJSON_IsArray(earr)) {
+                int dim = cJSON_GetArraySize(earr);
+                if (dim > 0) {
+                    if (g_hnsw_count >= g_hnsw_cap) {
+                        g_hnsw_cap *= 2;
+                        g_hnsw_nodes = (HNSWNode *)realloc(g_hnsw_nodes,
+                            g_hnsw_cap * sizeof(HNSWNode));
+                    }
+                    HNSWNode *node = &g_hnsw_nodes[g_hnsw_count];
+                    strncpy(node->id, mid, 63);
+                    node->id[63] = 0;
+                    node->vec = (float *)malloc(dim * sizeof(float));
+                    node->dim = dim;
+                    node->n_neighbors = 0;
+                    for (int i = 0; i < dim; i++) {
+                        cJSON *item = cJSON_GetArrayItem(earr, i);
+                        node->vec[i] = (float)(cJSON_IsNumber(item) ? item->valuedouble : 0.0);
+                    }
+                    if (dim == common_dim || common_dim == 0) common_dim = dim;
+                    g_hnsw_count++;
+                }
+                cJSON_Delete(earr);
+            }
+        }
+        free(mid); free(memb);
+        ryu_flat_tuple_destroy(&tup);
+    }
+    ryu_query_result_destroy(&result);
+
+    /* Build edges: for each node, find M nearest neighbors */
+    for (int i = 0; i < g_hnsw_count; i++) {
+        if (g_hnsw_nodes[i].dim != common_dim) continue;
+
+        /* Collect distances to all other nodes */
+        typedef struct { int idx; float score; } DistEntry;
+        DistEntry *dists = (DistEntry *)malloc(g_hnsw_count * sizeof(DistEntry));
+        int nd = 0;
+        for (int j = 0; j < g_hnsw_count; j++) {
+            if (j == i || g_hnsw_nodes[j].dim != common_dim) continue;
+            dists[nd].idx = j;
+            dists[nd].score = cosine_sim_hnsw(g_hnsw_nodes[i].vec, g_hnsw_nodes[j].vec, common_dim);
+            nd++;
+        }
+
+        /* Sort by similarity descending */
+        for (int a = 0; a < nd - 1; a++) {
+            int best = a;
+            for (int b = a + 1; b < nd; b++) {
+                if (dists[b].score > dists[best].score) best = b;
+            }
+            if (best != a) { DistEntry tmp = dists[a]; dists[a] = dists[best]; dists[best] = tmp; }
+        }
+
+        /* Keep top M */
+        int keep = nd < HNSW_M ? nd : HNSW_M;
+        for (int k = 0; k < keep; k++) {
+            g_hnsw_nodes[i].neighbors[k] = dists[k].idx;
+        }
+        g_hnsw_nodes[i].n_neighbors = keep;
+        free(dists);
+    }
+
+    g_hnsw_valid = 1;
+    DB_UNGUARD(adb);
+    printf("[HNSW] Built index with %d nodes (dim=%d)\n", g_hnsw_count, common_dim);
+    return g_hnsw_count;
+}
+
+/* ========================= Phase 9: Smart Compaction ========================= */
+
+int agent_db_compact_smart(AgentDB *adb, int max_age_days, float similarity_threshold) {
+    DB_GUARD(adb);
+
+    /* Step 1: Run standard compaction first */
+    DB_UNGUARD(adb);
+    int deleted = agent_db_compact(adb, max_age_days);
+    DB_GUARD(adb);
+
+    /* Step 2: Find and merge similar memories */
+    const char *q = "MATCH (m:MEMORY) WHERE m.category <> 'scalar' AND m.category <> 'decision_weights' "
+                    "RETURN m.id, m.content, m.embedding, m.category, m.key";
+    ryu_query_result result;
+    if (ryu_connection_query(&adb->_conn, q, &result) != RyuSuccess ||
+        !ryu_query_result_is_success(&result)) {
+        ryu_query_result_destroy(&result);
+        DB_UNGUARD(adb);
+        return deleted;
+    }
+
+    /* Collect all memory nodes */
+    typedef struct {
+        char id[64]; char content[1024]; char category[64]; char key[256];
+        float *vec; int dim; int merged;
+    } MemEntry;
+    MemEntry *entries = NULL;
+    int nentries = 0, cap = 64;
+    entries = (MemEntry *)malloc(cap * sizeof(MemEntry));
+
+    while (ryu_query_result_has_next(&result)) {
+        ryu_flat_tuple tup;
+        ryu_query_result_get_next(&result, &tup);
+        if (nentries >= cap) {
+            cap *= 2;
+            entries = (MemEntry *)realloc(entries, cap * sizeof(MemEntry));
+        }
+        MemEntry *e = &entries[nentries];
+        memset(e, 0, sizeof(MemEntry));
+        char *mid = dup_col(&tup, 0);
+        char *mcont = dup_col(&tup, 1);
+        char *memb = dup_col(&tup, 2);
+        char *mcat = dup_col(&tup, 3);
+        char *mkey = dup_col(&tup, 4);
+
+        if (mid) strncpy(e->id, mid, 63);
+        if (mcont) strncpy(e->content, mcont, 1023);
+        if (mcat) strncpy(e->category, mcat, 63);
+        if (mkey) strncpy(e->key, mkey, 255);
+
+        if (memb && memb[0]) {
+            cJSON *earr = cJSON_Parse(memb);
+            if (cJSON_IsArray(earr)) {
+                int dim = cJSON_GetArraySize(earr);
+                e->vec = (float *)malloc(dim * sizeof(float));
+                e->dim = dim;
+                for (int i = 0; i < dim; i++) {
+                    cJSON *item = cJSON_GetArrayItem(earr, i);
+                    e->vec[i] = (float)(cJSON_IsNumber(item) ? item->valuedouble : 0.0);
+                }
+                cJSON_Delete(earr);
+            }
+        }
+        nentries++;
+        free(mid); free(mcont); free(memb); free(mcat); free(mkey);
+        ryu_flat_tuple_destroy(&tup);
+    }
+    ryu_query_result_destroy(&result);
+
+    /* Cluster similar memories and merge */
+    int merged_count = 0;
+    for (int i = 0; i < nentries; i++) {
+        if (entries[i].merged) continue;
+        if (!entries[i].vec || entries[i].dim == 0) continue;
+
+        for (int j = i + 1; j < nentries; j++) {
+            if (entries[j].merged) continue;
+            if (!entries[j].vec || entries[j].dim != entries[i].dim) continue;
+
+            float sim = cosine_sim_hnsw(entries[i].vec, entries[j].vec, entries[i].dim);
+            if (sim >= similarity_threshold) {
+                /* Merge j into i: concatenate content */
+                char merged_content[2048];
+                snprintf(merged_content, sizeof(merged_content), "%s | %s",
+                         entries[i].content, entries[j].content);
+
+                /* Update i's content in graph */
+                char *esc_content = cypher_esc(merged_content);
+                char uq[3072];
+                snprintf(uq, sizeof(uq),
+                    "MATCH (m:MEMORY {id:'%s'}) SET m.content = '%s'",
+                    entries[i].id, esc_content);
+                db_exec(adb, uq);
+                free(esc_content);
+
+                /* Delete j from graph */
+                snprintf(uq, sizeof(uq),
+                    "MATCH (m:MEMORY {id:'%s'}) DELETE m", entries[j].id);
+                db_exec(adb, uq);
+
+                entries[j].merged = 1;
+                strncpy(entries[i].content, merged_content, 1023);
+                merged_count++;
+            }
+        }
+    }
+
+    /* Cleanup */
+    for (int i = 0; i < nentries; i++) {
+        free(entries[i].vec);
+    }
+    free(entries);
+
+    /* Invalidate HNSW index since we changed memory nodes */
+    g_hnsw_valid = 0;
+
+    DB_UNGUARD(adb);
+    printf("[DB] Smart compact: %d deleted, %d memories merged\n", deleted, merged_count);
+    return deleted + merged_count;
 }

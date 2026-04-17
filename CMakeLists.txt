@@ -16,6 +16,7 @@ FetchContent_MakeAvailable(kuzu)
 set(SOURCES
     runtime/src/main.c
     runtime/src/agent_db.c
+    runtime/src/agent_core.c
     runtime/src/tasks.c
     runtime/src/channel.c
     runtime/src/session.c

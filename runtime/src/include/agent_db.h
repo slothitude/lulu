@@ -156,7 +156,15 @@ cJSON *agent_db_file_workflow(AgentDB *adb, const char *path);
 /* Graph compaction: delete old LOG_EVENT, unused PROMPT_CACHE, orphaned TOOL_CALL nodes. */
 int   agent_db_compact(AgentDB *adb, int max_age_days);
 
-/* Task diff: compare tool sequences of two tasks. */
+/* Smart compaction: merge similar memories before deleting old ones. */
+int   agent_db_compact_smart(AgentDB *adb, int max_age_days, float similarity_threshold);
+
+/* HNSW-lite index for fast embedding search. Build lazily on first search.
+   Returns number of memory nodes indexed. */
+int   agent_db_memory_build_index(AgentDB *adb);
+
+/* Invalidate the HNSW index (call after memory mutations). */
+void  agent_db_memory_invalidate_index(void);
 cJSON *agent_db_task_diff(AgentDB *adb, const char *id_a, const char *id_b);
 
 /* ========================= Graph Stats ========================= */

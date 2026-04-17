@@ -68,5 +68,10 @@ typedef struct {
 /* Check if a role is enabled in the pipeline */
 int agent_pipeline_has_role(const AgentConfig *ac, const char *role);
 
+/* Get the PromptTemplate for a named role ("planner"/"actor"/"critic").
+   Returns pointer into the AgentConfig — valid as long as ac is alive.
+   Returns NULL for unknown role names. */
+const PromptTemplate *agent_config_get_role(const AgentConfig *ac, const char *role);
+
 /* Load agent.json. Returns 1 on success. */
 int agent_config_load(AgentConfig *ac, const char *path);
